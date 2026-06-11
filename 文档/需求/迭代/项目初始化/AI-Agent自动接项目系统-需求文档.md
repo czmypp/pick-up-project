@@ -2,7 +2,7 @@
 
 > **版本**：v1.4  
 > **日期**：2026-06-11  
-> **变更**：新增"生成-预览-修改/更新"标准模式——需求阶段、原型阶段、UI阶段均支持递进式交付（自动生成→在线预览→修改更新→重新生成）；新增统一工作流预览界面（左右分栏：AI对话输入 + 流程效果实时预览 + 确认/撤回操作），后续所有交付流程均遵循此模式，确保每个交付物可视化且支持持续迭代  
+> **变更**：新增"生成-预览-修改/更新"标准模式——需求阶段、原型阶段、UI阶段均支持递进式交付（自动生成→在线预览→修改更新→重新生成）；新增统一工作流预览界面（左右分栏：AI对话输入 + 流程效果实时预览 + 确认/撤回操作）；**新增§10：完整DDL/DML SQL（含v1.4新增表+种子数据）+ 后端模块划分与执行方案**；**新增§11：按模块拆分的完整执行方案（前后端代码结构 + SQL设计 + 接口映射）**；后续所有交付流程均遵循此模式，确保每个交付物可视化且支持持续迭代  
 > **技术栈**：Spring Boot 3.x + Langchain4j + Langgraph4j + Elasticsearch  
 > **前端**：Vue3 + TypeScript + Element Plus
 
@@ -19,6 +19,8 @@
 7. [后端项目模块划分与目录结构](#七后端项目模块划分与目录结构)
 8. [非功能性需求](#八非功能性需求)
 9. [RBAC 权限模型详细设计](#九rbac-权限模型详细设计)
+10. [v1.4 迭代：DDL/DML 与后端执行方案](#十v14-迭代ddldml-与后端执行方案)
+11. [模块化执行方案（前后端 + SQL 设计）](#十一模块化执行方案前后端--sql-设计)
 
 ---
 
@@ -3449,3 +3451,2781 @@ axios.interceptors.response.use(
 
 > **文档状态**：待评审  
 > **下一步**：架构设计文档 → 后端项目脚手架搭建 → AI 引擎开发
+
+
+
+## 十、v1.4 迭代：DDL/DML 与后端执行方案
+
+> **说明**：本章节整合 v1.4 迭代所需的全部数据库 DDL（新增表/变更）与 DML（种子数据），以及后端模块划分与接口执行方案。§6 已有的基础 DDL 不再重复，仅列出 v1.4 新增与变更部分。DML 覆盖全量初始化数据。
+
+---
+
+### 10.1 v1.4 数据库 DDL - 新增表
+
+#### 10.1.1 交付物版本历史表 `t_deliverable_version`
+
+```sql
+-- 记录每个交付物每次AI生成/修改的版本快照，支持版本回溯与Diff对比
+CREATE TABLE t_deliverable_version (
+    id                VARCHAR(36) PRIMARY KEY,
+    deliverable_id    VARCHAR(36) NOT NULL,             -- 关联 t_deliverable.id
+    project_id        VARCHAR(36) NOT NULL,             -- 冗余字段加速查询
+    version           VARCHAR(20) NOT NULL,             -- v1.0, v1.1, v2.0
+    content_text      TEXT,                             -- 完整内容快照（纯文本/Markdown）
+    content_json      JSONB,                            -- 结构化内容快照（JSON格式）
+    file_path         VARCHAR(500),                     -- 版本文件存储路径
+    file_size         BIGINT,                           -- 文件大小（字节）
+    content_hash      VARCHAR(64),                      -- SHA256 内容校验
+    change_summary    TEXT,                             -- 变更摘要（AI自动生成）
+    trigger_type      VARCHAR(30) NOT NULL DEFAULT 'AI_GENERATE',  -- AI_GENERATE / USER_FEEDBACK / MANUAL_EDIT / ROLLBACK
+    parent_version    VARCHAR(20),                      -- 回溯来源版本号
+    created_by        VARCHAR(36),                      -- 触发人（用户ID或AI标识）
+    created_at        TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_dv_deliverable ON t_deliverable_version(deliverable_id);
+CREATE INDEX idx_dv_project     ON t_deliverable_version(project_id);
+CREATE INDEX idx_dv_version     ON t_deliverable_version(deliverable_id, version);
+```
+
+#### 10.1.2 交付物修改反馈表 `t_deliverable_feedback`
+
+```sql
+-- 记录用户对交付物的每次修改意见，用于AI增量更新的上下文追踪
+CREATE TABLE t_deliverable_feedback (
+    id                VARCHAR(36) PRIMARY KEY,
+    project_id        VARCHAR(36) NOT NULL,
+    deliverable_id    VARCHAR(36) NOT NULL,             -- 关联 t_deliverable.id
+    deliverable_type  VARCHAR(50) NOT NULL,             -- PRD / PROTOTYPE / UI_DESIGN
+    feedback_type     VARCHAR(30) NOT NULL DEFAULT 'TEXT', -- TEXT / CHAPTER_EDIT / COMPONENT_EDIT / TOKEN_EDIT / LAYOUT_ADJUST
+    target_section    VARCHAR(200),                     -- 修改目标章节/组件/页面标识
+    feedback_content  TEXT NOT NULL,                    -- 修改意见正文
+    before_snapshot   TEXT,                             -- 修改前内容快照
+    after_snapshot    TEXT,                             -- AI更新后内容快照
+    status            VARCHAR(30) NOT NULL DEFAULT 'PENDING', -- PENDING / PROCESSING / COMPLETED / REJECTED
+    from_version      VARCHAR(20),                      -- 修改前版本号
+    to_version        VARCHAR(20),                      -- 修改后版本号
+    ai_response       TEXT,                             -- AI处理响应说明
+    created_by        VARCHAR(36) NOT NULL,             -- 提交反馈的用户ID
+    processed_at      TIMESTAMP,
+    created_at        TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_df_project    ON t_deliverable_feedback(project_id);
+CREATE INDEX idx_df_deliverable ON t_deliverable_feedback(deliverable_id);
+CREATE INDEX idx_df_status     ON t_deliverable_feedback(status);
+```
+
+#### 10.1.3 工作流子任务表 `t_workflow_subtask`
+
+```sql
+-- 记录工作流每个阶段内部的子任务执行情况（对应前端预览面板底部的"任务列表"）
+CREATE TABLE t_workflow_subtask (
+    id                VARCHAR(36) PRIMARY KEY,
+    project_id        VARCHAR(36) NOT NULL,
+    stage_id          VARCHAR(36) NOT NULL,             -- 关联 t_workflow_stage.id
+    stage_name        VARCHAR(50) NOT NULL,             -- 冗余，便于直接查询
+    task_name         VARCHAR(200) NOT NULL,            -- 任务名称（如：解析项目模板与功能模块）
+    task_order        INTEGER NOT NULL DEFAULT 0,       -- 任务执行顺序
+    status            VARCHAR(30) NOT NULL DEFAULT 'PENDING', -- PENDING / RUNNING / COMPLETED / FAILED / SKIPPED
+    output_files      JSONB,                            -- 产出的文件列表 [{fileName, filePath, fileSize}]
+    error_message     TEXT,
+    started_at        TIMESTAMP,
+    completed_at      TIMESTAMP,
+    duration_ms       BIGINT,
+    created_at        TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_ws_project ON t_workflow_subtask(project_id);
+CREATE INDEX idx_ws_stage   ON t_workflow_subtask(stage_id);
+CREATE INDEX idx_ws_status  ON t_workflow_subtask(project_id, status);
+```
+
+#### 10.1.4 交付物变更记录表 `t_deliverable_change_log`
+
+```sql
+-- 记录每次预览界面的具体变更条目（对应前端"变更内容表格"的每一行）
+CREATE TABLE t_deliverable_change_log (
+    id                VARCHAR(36) PRIMARY KEY,
+    project_id        VARCHAR(36) NOT NULL,
+    deliverable_id    VARCHAR(36) NOT NULL,
+    version_id        VARCHAR(36) NOT NULL,             -- 关联 t_deliverable_version.id
+    change_position   VARCHAR(300) NOT NULL,            -- 更新位置（如：版本号 / §1 项目概述 / §2 功能需求）
+    change_type       VARCHAR(10) NOT NULL DEFAULT 'ADD', -- ADD / MODIFY / DELETE
+    change_content    TEXT NOT NULL,                    -- 变更内容描述
+    change_detail     JSONB,                            -- 结构化变更详情 [{field, oldValue, newValue}]
+    sort_order        INTEGER DEFAULT 0,               -- 在变更表格中的展示顺序
+    created_at        TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_dcl_deliverable ON t_deliverable_change_log(deliverable_id);
+CREATE INDEX idx_dcl_version     ON t_deliverable_change_log(version_id);
+CREATE INDEX idx_dcl_project     ON t_deliverable_change_log(project_id);
+```
+
+#### 10.1.5 工作流预览状态表 `t_workflow_preview_state`
+
+```sql
+-- 记录用户在各阶段预览界面的操作状态（确认/撤回/跳过）
+CREATE TABLE t_workflow_preview_state (
+    id                VARCHAR(36) PRIMARY KEY,
+    project_id        VARCHAR(36) NOT NULL,
+    stage_name        VARCHAR(50) NOT NULL,             -- DOC_GENERATING / PROTOTYPE_GENERATING / UI_DESIGNING
+    current_version   VARCHAR(20),                      -- 当前预览版本号
+    preview_status    VARCHAR(30) NOT NULL DEFAULT 'GENERATING',   -- GENERATING / PREVIEWING / UPDATING / CONFIRMED / REVERTED
+    confirmed_at      TIMESTAMP,                        -- 用户确认时间
+    confirmed_by      VARCHAR(36),                      -- 确认人
+    revert_count      INTEGER DEFAULT 0,               -- 撤回次数
+    last_action       VARCHAR(30),                      -- 最后一次操作：CONFIRM / REVERT / SKIP / UPDATE
+    last_action_at    TIMESTAMP,
+    created_at        TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_wps_project ON t_workflow_preview_state(project_id);
+CREATE INDEX idx_wps_stage   ON t_workflow_preview_state(project_id, stage_name);
+```
+
+#### 10.1.6 现有表 v1.4 变更
+
+```sql
+-- t_project 表扩展：增加预览状态跟踪与模板/模块关联
+ALTER TABLE t_project ADD COLUMN IF NOT EXISTS template_id       VARCHAR(36);
+ALTER TABLE t_project ADD COLUMN IF NOT EXISTS layout_id         VARCHAR(36);
+ALTER TABLE t_project ADD COLUMN IF NOT EXISTS selected_modules   JSONB;
+ALTER TABLE t_project ADD COLUMN IF NOT EXISTS layout_config_override JSONB;
+ALTER TABLE t_project ADD COLUMN IF NOT EXISTS current_preview_version VARCHAR(20);
+ALTER TABLE t_project ADD COLUMN IF NOT EXISTS last_preview_stage    VARCHAR(50);
+
+-- t_deliverable 表扩展：增加版本跟踪字段
+ALTER TABLE t_deliverable ADD COLUMN IF NOT EXISTS current_version  VARCHAR(20) DEFAULT 'v1.0';
+ALTER TABLE t_deliverable ADD COLUMN IF NOT EXISTS version_count    INTEGER DEFAULT 1;
+ALTER TABLE t_deliverable ADD COLUMN IF NOT EXISTS last_feedback_at TIMESTAMP;
+ALTER TABLE t_deliverable ADD COLUMN IF NOT EXISTS confirmed        BOOLEAN DEFAULT FALSE;
+ALTER TABLE t_deliverable ADD COLUMN IF NOT EXISTS confirmed_at     TIMESTAMP;
+ALTER TABLE t_deliverable ADD COLUMN IF NOT EXISTS confirmed_by     VARCHAR(36);
+
+-- t_workflow_stage 表扩展：增加子任务计数
+ALTER TABLE t_workflow_stage ADD COLUMN IF NOT EXISTS total_subtasks   INTEGER DEFAULT 0;
+ALTER TABLE t_workflow_stage ADD COLUMN IF NOT EXISTS completed_subtasks INTEGER DEFAULT 0;
+```
+
+---
+
+### 10.2 数据库 DML - 完整初始化种子数据
+
+> **说明**：以下 DML 基于《交互原型-核心业务流程.html》中的 mock 数据生成，确保数据库与原型数据一致性。所有 ID 使用固定 UUID 便于调试。
+
+#### 10.2.1 用户数据 `t_user`
+
+```sql
+-- 密码均为 BCrypt 加密后的值，明文统一为 admin123 / user123
+INSERT INTO t_user (id, username, email, password_hash, nickname, status, monthly_quota, used_quota, created_at, updated_at) VALUES
+('u1', 'admin',     'admin@pickup.local',  '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', '系统管理员', 'ACTIVE', 100, 22, NOW(), NOW()),
+('u2', 'user',      'user@pickup.local',   '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', '普通用户',   'ACTIVE',  50, 12, NOW(), NOW()),
+('u3', 'operator',  'operator@pickup.local','$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', '运营人员',   'ACTIVE',  80,  5, NOW(), NOW()),
+('u4', 'manager',   'manager@pickup.local', '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', '管理员',     'ACTIVE',  80,  8, NOW(), NOW());
+```
+
+#### 10.2.2 角色数据 `t_role`
+
+```sql
+INSERT INTO t_role (id, name, code, description, status, is_system, created_at, updated_at) VALUES
+('r1', '超级管理员', 'SUPER_ADMIN', '系统最高权限，管理所有功能',             'ACTIVE', TRUE,  NOW(), NOW()),
+('r2', '管理员',     'ADMIN',       '管理系统配置与用户',                    'ACTIVE', TRUE,  NOW(), NOW()),
+('r3', '运营人员',   'OPERATOR',    '项目审核与数据统计',                    'ACTIVE', FALSE, NOW(), NOW()),
+('r4', '普通用户',   'USER',        '基础用户权限',                          'ACTIVE', TRUE,  NOW(), NOW());
+```
+
+#### 10.2.3 用户-角色关联 `t_user_role`
+
+```sql
+INSERT INTO t_user_role (id, user_id, role_id, created_at) VALUES
+('ur1', 'u1', 'r1', NOW()),
+('ur2', 'u2', 'r4', NOW()),
+('ur3', 'u3', 'r3', NOW()),
+('ur4', 'u4', 'r2', NOW());
+```
+
+#### 10.2.4 菜单数据 `t_menu`
+
+```sql
+-- 目录层
+INSERT INTO t_menu (id, parent_id, name, type, path, component, icon, permission, sort_order, visible, keep_alive, status, created_at, updated_at) VALUES
+('m1',  NULL,   '工作台',       'DIR',  NULL,               NULL,                        'dashboard', NULL,              1, TRUE, FALSE, 'ACTIVE', NOW(), NOW()),
+('m3',  NULL,   '项目管理',     'DIR',  NULL,               NULL,                        'project',   NULL,              2, TRUE, FALSE, 'ACTIVE', NOW(), NOW()),
+('m6',  NULL,   '系统管理',     'DIR',  NULL,               NULL,                        'setting',   NULL,              3, TRUE, FALSE, 'ACTIVE', NOW(), NOW()),
+('m15', NULL,   '日志审计',     'DIR',  NULL,               NULL,                        'audit',     NULL,              4, TRUE, FALSE, 'ACTIVE', NOW(), NOW());
+
+-- 工作台下
+INSERT INTO t_menu (id, parent_id, name, type, path, component, icon, permission, sort_order, visible, keep_alive, status, created_at, updated_at) VALUES
+('m2', 'm1', '数据概览', 'MENU', '/dashboard', 'dashboard/index', 'chart', 'dashboard:view', 1, TRUE, FALSE, 'ACTIVE', NOW(), NOW());
+
+-- 项目管理下
+INSERT INTO t_menu (id, parent_id, name, type, path, component, icon, permission, sort_order, visible, keep_alive, status, created_at, updated_at) VALUES
+('m4',  'm3', '项目列表',   'MENU', '/projects',                'projects/list',             'list',      'project:view',      1, TRUE, FALSE, 'ACTIVE', NOW(), NOW()),
+('m5',  'm3', '创建项目',   'MENU', '/projects/create',         'projects/create',           'plus',      'project:create',    2, TRUE, FALSE, 'ACTIVE', NOW(), NOW()),
+('m22', 'm3', '工作流预览', 'MENU', '/projects/workflow-preview','projects/workflow-preview', 'file-text', 'project:workflow',  3, TRUE, FALSE, 'ACTIVE', NOW(), NOW());
+
+-- 系统管理 → 权限管理（子目录）
+INSERT INTO t_menu (id, parent_id, name, type, path, component, icon, permission, sort_order, visible, keep_alive, status, created_at, updated_at) VALUES
+('m7', 'm6', '权限管理', 'DIR', NULL, NULL, 'safety', NULL, 1, TRUE, FALSE, 'ACTIVE', NOW(), NOW());
+
+INSERT INTO t_menu (id, parent_id, name, type, path, component, icon, permission, sort_order, visible, keep_alive, status, created_at, updated_at) VALUES
+('m8',  'm7', '用户管理', 'MENU', '/system/users',  'system/users/index',  'user', 'user:view',  1, TRUE, FALSE, 'ACTIVE', NOW(), NOW()),
+('m9',  'm7', '角色管理', 'MENU', '/system/roles',  'system/roles/index',  'team', 'role:view',  2, TRUE, FALSE, 'ACTIVE', NOW(), NOW()),
+('m10', 'm7', '菜单管理', 'MENU', '/system/menus',  'system/menus/index',  'menu', 'menu:view',  3, TRUE, FALSE, 'ACTIVE', NOW(), NOW());
+
+-- 菜单管理下的按钮权限
+INSERT INTO t_menu (id, parent_id, name, type, path, component, icon, permission, sort_order, visible, keep_alive, status, created_at, updated_at) VALUES
+('m11', 'm10', '新增菜单', 'BTN', NULL, NULL, NULL, 'menu:create', 1, TRUE, FALSE, 'ACTIVE', NOW(), NOW()),
+('m12', 'm10', '编辑菜单', 'BTN', NULL, NULL, NULL, 'menu:edit',   2, TRUE, FALSE, 'ACTIVE', NOW(), NOW()),
+('m13', 'm10', '删除菜单', 'BTN', NULL, NULL, NULL, 'menu:delete', 3, TRUE, FALSE, 'ACTIVE', NOW(), NOW());
+
+-- 系统管理 → 系统配置
+INSERT INTO t_menu (id, parent_id, name, type, path, component, icon, permission, sort_order, visible, keep_alive, status, created_at, updated_at) VALUES
+('m14', 'm6', '系统配置', 'MENU', '/system/config', 'system/config', 'tool', NULL, 2, TRUE, FALSE, 'ACTIVE', NOW(), NOW());
+
+-- 系统管理 → 模板管理（子目录）
+INSERT INTO t_menu (id, parent_id, name, type, path, component, icon, permission, sort_order, visible, keep_alive, status, created_at, updated_at) VALUES
+('m17', 'm6', '模板管理', 'DIR', NULL, NULL, 'template', NULL, 3, TRUE, FALSE, 'ACTIVE', NOW(), NOW());
+
+INSERT INTO t_menu (id, parent_id, name, type, path, component, icon, permission, sort_order, visible, keep_alive, status, created_at, updated_at) VALUES
+('m18', 'm17', '模板列表',   'MENU', '/system/templates', 'system/templates/index', 'layers',  'template:view', 1, TRUE, FALSE, 'ACTIVE', NOW(), NOW()),
+('m19', 'm17', '功能项库',   'MENU', '/system/modules',   'system/modules/index',   'puzzle',  'module:view',   2, TRUE, FALSE, 'ACTIVE', NOW(), NOW()),
+('m20', 'm17', '排版规则库', 'MENU', '/system/layouts',   'system/layouts/index',   'layout',  'layout:view',   3, TRUE, FALSE, 'ACTIVE', NOW(), NOW()),
+('m21', 'm17', '功能管理',   'MENU', '/system/features',  'system/features/index',  'feature', 'feature:view',  4, TRUE, FALSE, 'ACTIVE', NOW(), NOW());
+
+-- 日志审计下
+INSERT INTO t_menu (id, parent_id, name, type, path, component, icon, permission, sort_order, visible, keep_alive, status, created_at, updated_at) VALUES
+('m16', 'm15', '操作日志', 'MENU', '/logs/audit', 'logs/audit', 'file-text', 'log:view', 1, TRUE, FALSE, 'ACTIVE', NOW(), NOW());
+```
+
+#### 10.2.5 角色-菜单关联 `t_role_menu`
+
+```sql
+-- r1 超级管理员：全部菜单
+INSERT INTO t_role_menu (id, role_id, menu_id, created_at) VALUES
+('rm001','r1','m1',NOW()),('rm002','r1','m2',NOW()),('rm003','r1','m3',NOW()),
+('rm004','r1','m4',NOW()),('rm005','r1','m5',NOW()),('rm006','r1','m22',NOW()),
+('rm007','r1','m6',NOW()),('rm008','r1','m7',NOW()),('rm009','r1','m8',NOW()),
+('rm010','r1','m9',NOW()),('rm011','r1','m10',NOW()),('rm012','r1','m11',NOW()),
+('rm013','r1','m12',NOW()),('rm014','r1','m13',NOW()),('rm015','r1','m14',NOW()),
+('rm016','r1','m15',NOW()),('rm017','r1','m16',NOW()),('rm018','r1','m17',NOW()),
+('rm019','r1','m18',NOW()),('rm020','r1','m19',NOW()),('rm021','r1','m20',NOW()),
+('rm022','r1','m21',NOW());
+
+-- r2 管理员：无按钮权限，无可管理即可
+INSERT INTO t_role_menu (id, role_id, menu_id, created_at) VALUES
+('rm023','r2','m1',NOW()),('rm024','r2','m2',NOW()),('rm025','r2','m3',NOW()),
+('rm026','r2','m4',NOW()),('rm027','r2','m5',NOW()),('rm028','r2','m22',NOW()),
+('rm029','r2','m6',NOW()),('rm030','r2','m7',NOW()),('rm031','r2','m8',NOW()),
+('rm032','r2','m14',NOW()),('rm033','r2','m17',NOW()),('rm034','r2','m18',NOW()),
+('rm035','r2','m19',NOW()),('rm036','r2','m20',NOW()),('rm037','r2','m21',NOW());
+
+-- r3 / r4 普通用户：仅工作台 + 项目管理
+INSERT INTO t_role_menu (id, role_id, menu_id, created_at) VALUES
+('rm038','r3','m1',NOW()),('rm039','r3','m2',NOW()),('rm040','r3','m3',NOW()),
+('rm041','r3','m4',NOW()),('rm042','r3','m5',NOW()),('rm043','r3','m22',NOW());
+
+INSERT INTO t_role_menu (id, role_id, menu_id, created_at) VALUES
+('rm044','r4','m1',NOW()),('rm045','r4','m2',NOW()),('rm046','r4','m3',NOW()),
+('rm047','r4','m4',NOW()),('rm048','r4','m5',NOW()),('rm049','r4','m22',NOW());
+```
+
+#### 10.2.6 角色-接口权限关联 `t_role_api`
+
+```sql
+-- r1 超级管理员：全部API（索引全量）
+INSERT INTO t_role_api (id, role_id, method, path_pattern, description, created_at) VALUES
+('ra001','r1','GET',    '/api/v1/auth/**',        '认证接口-查询',   NOW()),
+('ra002','r1','POST',   '/api/v1/auth/**',        '登录/注册接口',   NOW()),
+('ra003','r1','GET',    '/api/v1/projects/**',    '项目管理-查询',   NOW()),
+('ra004','r1','POST',   '/api/v1/projects/**',    '项目管理-创建',   NOW()),
+('ra005','r1','PUT',    '/api/v1/projects/**',    '项目管理-更新',   NOW()),
+('ra006','r1','DELETE', '/api/v1/projects/**',    '项目管理-删除',   NOW()),
+('ra007','r1','GET',    '/api/v1/deliverables/**','交付物-查询',     NOW()),
+('ra008','r1','PUT',    '/api/v1/deliverables/**','交付物-更新',     NOW()),
+('ra009','r1','POST',   '/api/v1/deliverables/**','交付物-写入',     NOW()),
+('ra010','r1','DELETE', '/api/v1/deliverables/**','交付物-删除',     NOW()),
+('ra011','r1','GET',    '/api/v1/workflow/**',    '工作流-查询',     NOW()),
+('ra012','r1','GET',    '/api/v1/admin/**',       '管理接口-查询',   NOW()),
+('ra013','r1','POST',   '/api/v1/admin/**',       '管理接口-写入',   NOW()),
+('ra014','r1','PUT',    '/api/v1/admin/**',       '管理接口-更新',   NOW()),
+('ra015','r1','DELETE', '/api/v1/admin/**',       '管理接口-删除',   NOW()),
+('ra016','r1','GET',    '/api/v1/templates/**',   '用户端模板-查询', NOW()),
+('ra017','r1','GET',    '/api/v1/modules/**',     '用户端模块-查询', NOW()),
+('ra018','r1','GET',    '/api/v1/layouts/**',     '用户端排版-查询', NOW());
+
+-- r2 管理员：可管理配置模块，无权管理角色和菜单删除
+INSERT INTO t_role_api (id, role_id, method, path_pattern, description, created_at) VALUES
+('ra019','r2','GET',    '/api/v1/auth/**',        '认证接口-查询',   NOW()),
+('ra020','r2','POST',   '/api/v1/auth/**',        '登录/注册接口',   NOW()),
+('ra021','r2','GET',    '/api/v1/projects/**',    '项目管理-查询',   NOW()),
+('ra022','r2','POST',   '/api/v1/projects/**',    '项目管理-创建',   NOW()),
+('ra023','r2','PUT',    '/api/v1/projects/**',    '项目管理-更新',   NOW()),
+('ra024','r2','GET',    '/api/v1/deliverables/**','交付物-查询',     NOW()),
+('ra025','r2','GET',    '/api/v1/workflow/**',    '工作流-查询',     NOW()),
+('ra026','r2','GET',    '/api/v1/admin/**',       '管理接口-查询',   NOW()),
+('ra027','r2','POST',   '/api/v1/admin/**',       '管理接口-写入',   NOW()),
+('ra028','r2','PUT',    '/api/v1/admin/**',       '管理接口-更新',   NOW()),
+('ra029','r2','GET',    '/api/v1/templates/**',   '用户端模板-查询', NOW());
+
+-- r3 / r4 普通用户：仅查询项目管理、交付物、工作流、用户端模板
+INSERT INTO t_role_api (id, role_id, method, path_pattern, description, created_at) VALUES
+('ra030','r3','GET',    '/api/v1/auth/**',        '认证接口-查询',   NOW()),
+('ra031','r3','POST',   '/api/v1/auth/**',        '登录/注册接口',   NOW()),
+('ra032','r3','GET',    '/api/v1/projects/**',    '项目管理-查询',   NOW()),
+('ra033','r3','POST',   '/api/v1/projects/**',    '项目管理-创建',   NOW()),
+('ra034','r3','GET',    '/api/v1/deliverables/**','交付物-查询',     NOW()),
+('ra035','r3','GET',    '/api/v1/workflow/**',    '工作流-查询',     NOW());
+
+INSERT INTO t_role_api (id, role_id, method, path_pattern, description, created_at) VALUES
+('ra036','r4','GET',    '/api/v1/auth/**',        '认证接口-查询',   NOW()),
+('ra037','r4','POST',   '/api/v1/auth/**',        '登录/注册接口',   NOW()),
+('ra038','r4','GET',    '/api/v1/projects/**',    '项目管理-查询',   NOW()),
+('ra039','r4','POST',   '/api/v1/projects/**',    '项目管理-创建',   NOW()),
+('ra040','r4','GET',    '/api/v1/deliverables/**','交付物-查询',     NOW()),
+('ra041','r4','GET',    '/api/v1/workflow/**',    '工作流-查询',     NOW());
+```
+
+#### 10.2.7 功能模块库 `t_function_module`
+
+```sql
+INSERT INTO t_function_module (id, module_name, module_key, description, domain, icon, tags, is_core, sort_order, is_active, created_at, updated_at) VALUES
+('md1',  '用户认证',      'USER_AUTH',      '用户注册、登录、密码找回',                       'GENERAL',      'safety',     '["认证","基础"]',         TRUE,  1,  TRUE, NOW(), NOW()),
+('md2',  'RBAC权限管理',  'RBAC',           '角色管理、菜单权限、接口鉴权',                    'GENERAL',      'shield',     '["权限","安全"]',         FALSE, 2,  TRUE, NOW(), NOW()),
+('md3',  '商品管理',      'PRODUCT_MGT',    '商品CRUD、分类、SKU、库存',                       'ECOMMERCE',    'box',        '["电商","核心"]',         TRUE,  3,  TRUE, NOW(), NOW()),
+('md4',  '订单管理',      'ORDER_MGT',      '订单创建、流转、售后',                            'ECOMMERCE',    'document',   '["电商","核心"]',         TRUE,  4,  TRUE, NOW(), NOW()),
+('md5',  '购物车',        'CART',           '购物车管理、凑单推荐',                            'ECOMMERCE',    'shopping-cart','["电商"]',              FALSE, 5,  TRUE, NOW(), NOW()),
+('md6',  '支付集成',      'PAYMENT',        '微信/支付宝/银联对接',                            'ECOMMERCE',    'credit-card', '["电商","支付"]',        FALSE, 6,  TRUE, NOW(), NOW()),
+('md7',  '文章管理',      'CMS_ARTICLE',    '文章发布、编辑、分类',                            'CMS',          'edit',        '["内容"]',               TRUE,  7,  TRUE, NOW(), NOW()),
+('md8',  '分类管理',      'CMS_CATEGORY',   '内容分类树、标签管理',                            'CMS',          'folder',      '["内容"]',               TRUE,  8,  TRUE, NOW(), NOW()),
+('md9',  '评论系统',      'CMS_COMMENT',    '文章评论、审核、举报',                            'CMS',          'chat',        '["内容","互动"]',         FALSE, 9,  TRUE, NOW(), NOW()),
+('md10', '微信登录',      'WX_LOGIN',       '微信OAuth授权登录',                              'MINI_PROGRAM', 'wechat',      '["小程序","认证"]',       TRUE,  10, TRUE, NOW(), NOW()),
+('md11', '微信支付',      'WX_PAY',         '小程序内微信支付',                               'MINI_PROGRAM', 'money',       '["小程序","支付"]',       FALSE, 11, TRUE, NOW(), NOW()),
+('md12', '数据看板',      'DASHBOARD',      '关键指标可视化、图表',                            'ADMIN',        'chart',       '["管理","分析"]',         TRUE,  12, TRUE, NOW(), NOW()),
+('md13', '数据导出',      'DATA_EXPORT',    'Excel/CSV数据导出',                              'GENERAL',      'download',    '["工具"]',               FALSE, 13, TRUE, NOW(), NOW()),
+('md14', '消息通知',      'NOTIFICATION',   '站内信、邮件、短信通知',                          'GENERAL',      'bell',        '["消息"]',               FALSE, 14, TRUE, NOW(), NOW()),
+('md15', '文件上传',      'FILE_UPLOAD',    '图片/文件上传、OSS存储',                          'GENERAL',      'paperclip',   '["文件"]',               FALSE, 15, TRUE, NOW(), NOW()),
+('md16', '操作日志',      'LOG_AUDIT',      '操作记录、审计追踪',                              'GENERAL',      'scroll',      '["审计"]',               FALSE, 16, TRUE, NOW(), NOW()),
+('md17', '搜索功能',      'SEARCH',         '全文搜索、高级筛选',                              'GENERAL',      'search',      '["搜索"]',               FALSE, 17, TRUE, NOW(), NOW());
+```
+
+#### 10.2.8 排版规则库 `t_layout_rule`
+
+```sql
+INSERT INTO t_layout_rule (id, layout_name, layout_type, config_json, description, applicable_scenes, is_active, created_at, updated_at) VALUES
+('ly1', '经典侧边栏布局', 'SidebarLayout',      '{"header":{"height":56,"fixed":true,"showLogo":true},"sidebar":{"width":220,"collapsible":true,"position":"left"},"content":{"maxWidth":"100%","padding":24},"footer":{"height":48,"show":false},"themeColors":{"primary":"#4F46E5"}}', '左侧固定导航+右侧内容区（顶部工具栏）',    '["后台管理系统","数据管理平台"]', TRUE, NOW(), NOW()),
+('ly2', '上中下布局',      'HeaderMainFooter',   '{"header":{"height":64,"fixed":false,"showLogo":true},"sidebar":null,"content":{"maxWidth":"1200px","padding":32},"footer":{"height":80,"show":true}}', '顶部导航+中间内容+底部信息栏',            '["官网","门户"]',                 TRUE, NOW(), NOW()),
+('ly3', '混合导航布局',    'MixedNav',           '{"header":{"height":56,"fixed":true},"sidebar":{"width":200,"collapsible":true},"content":{"padding":24},"footer":{"show":false}}', '顶部一级导航+侧边二级菜单+内容区',        '["大型管理后台"]',                TRUE, NOW(), NOW()),
+('ly4', '响应式网格布局',  'GridLayout',         '{"header":{"height":56},"sidebar":null,"content":{"maxWidth":"100%","padding":16,"gridColumns":3},"footer":{"show":false}}', '基于Card/Grid的内容型布局',              '["数据看板","仪表盘"]',           TRUE, NOW(), NOW()),
+('ly5', '底部Tab布局',     'TabBarLayout',       '{"header":{"height":48,"showLogo":false},"sidebar":null,"content":{"padding":12},"tabBar":{"position":"bottom","items":4},"footer":{"show":false}}', '底部Tab切换+顶栏标题区',                 '["移动端","小程序"]',             TRUE, NOW(), NOW()),
+('ly6', '单页全屏布局',    'FullScreen',         '{"header":{"show":false},"sidebar":null,"content":{"maxWidth":"100%","padding":0},"footer":{"show":false}}', '全屏滚动/无导航纯内容页',                '["登录页","落地页"]',             TRUE, NOW(), NOW());
+```
+
+#### 10.2.9 项目模板 `t_project_template`
+
+```sql
+INSERT INTO t_project_template (id, template_name, template_code, category, description, project_type, tech_stack, is_active, is_system, usage_count, sort_order, created_at, updated_at) VALUES
+('t1', '电商管理平台', 'ecommerce-mgmt', 'ECOMMERCE',    '适用于B2C/B2B电商场景，包含商品、订单、支付等核心模块',               'WEB_APP',  '{"frontend":"Vue3+ElementPlus","backend":"Spring Boot 3","database":"PostgreSQL","cache":"Redis"}', TRUE, TRUE,  156, 1, NOW(), NOW()),
+('t2', '后台管理系统', 'admin-panel',    'ADMIN_PANEL',  '通用管理后台框架模板，含权限、看板、日志等基础模块',                  'WEB_APP',  '{"frontend":"Vue3+ElementPlus","backend":"Spring Boot 3","database":"PostgreSQL","cache":"Redis"}', TRUE, TRUE,   89, 2, NOW(), NOW()),
+('t3', '微信小程序',   'mini-program',   'MINI_PROGRAM', '微信小程序商城模板，包含微信登录、支付等小程序特有模块',              'MINI_PROGRAM','{"frontend":"微信原生+Vue3","backend":"Spring Boot 3","database":"PostgreSQL","cache":"Redis"}', TRUE, TRUE,   64, 3, NOW(), NOW()),
+('t4', '内容管理系统', 'cms-system',     'CMS',          '博客/资讯/文档类系统模板，含文章管理、分类、评论',                  'WEB_APP',  '{"frontend":"Vue3+ElementPlus","backend":"Spring Boot 3","database":"PostgreSQL","cache":"Redis"}', TRUE, TRUE,   42, 4, NOW(), NOW()),
+('t5', 'API服务',      'api-service',    'API_SERVICE',  '纯后端REST API服务模板，无前端页面',                                'API_SERVICE','{"frontend":"无","backend":"Spring Boot 3","database":"PostgreSQL","cache":"Redis"}',               TRUE, TRUE,   28, 5, NOW(), NOW());
+```
+
+#### 10.2.10 模板-功能模块关联 `t_template_function`
+
+```sql
+-- t1 电商管理平台：md1(必),md3(必),md4(必),md5,md6,md2,md14,md15
+INSERT INTO t_template_function (id, template_id, module_id, is_required, sort_order, created_at) VALUES
+('tf01','t1','md1',TRUE, 1,NOW()),('tf02','t1','md3',TRUE, 2,NOW()),('tf03','t1','md4',TRUE, 3,NOW()),
+('tf04','t1','md5',FALSE,4,NOW()),('tf05','t1','md6',FALSE,5,NOW()),('tf06','t1','md2',FALSE,6,NOW()),
+('tf07','t1','md14',FALSE,7,NOW()),('tf08','t1','md15',FALSE,8,NOW());
+
+-- t2 后台管理系统：md1(必),md2(必),md12(必),md16,md13,md15
+INSERT INTO t_template_function (id, template_id, module_id, is_required, sort_order, created_at) VALUES
+('tf09','t2','md1',TRUE, 1,NOW()),('tf10','t2','md2',TRUE, 2,NOW()),('tf11','t2','md12',TRUE, 3,NOW()),
+('tf12','t2','md16',FALSE,4,NOW()),('tf13','t2','md13',FALSE,5,NOW()),('tf14','t2','md15',FALSE,6,NOW());
+
+-- t3 微信小程序：md10(必),md3(必),md4(必),md11,md5,md14
+INSERT INTO t_template_function (id, template_id, module_id, is_required, sort_order, created_at) VALUES
+('tf15','t3','md10',TRUE, 1,NOW()),('tf16','t3','md3',TRUE, 2,NOW()),('tf17','t3','md4',TRUE, 3,NOW()),
+('tf18','t3','md11',FALSE,4,NOW()),('tf19','t3','md5',FALSE,5,NOW()),('tf20','t3','md14',FALSE,6,NOW());
+
+-- t4 内容管理系统：md1(必),md7(必),md8(必),md9,md17,md15
+INSERT INTO t_template_function (id, template_id, module_id, is_required, sort_order, created_at) VALUES
+('tf21','t4','md1',TRUE, 1,NOW()),('tf22','t4','md7',TRUE, 2,NOW()),('tf23','t4','md8',TRUE, 3,NOW()),
+('tf24','t4','md9',FALSE,4,NOW()),('tf25','t4','md17',FALSE,5,NOW()),('tf26','t4','md15',FALSE,6,NOW());
+
+-- t5 API服务：md1(必),md2,md17,md16
+INSERT INTO t_template_function (id, template_id, module_id, is_required, sort_order, created_at) VALUES
+('tf27','t5','md1',TRUE, 1,NOW()),('tf28','t5','md2',FALSE,2,NOW()),('tf29','t5','md17',FALSE,3,NOW()),
+('tf30','t5','md16',FALSE,4,NOW());
+```
+
+#### 10.2.11 模板-排版规则关联 `t_template_layout`
+
+```sql
+INSERT INTO t_template_layout (id, template_id, layout_id, is_default, created_at) VALUES
+('tl01','t1','ly1',TRUE, NOW()), ('tl02','t1','ly3',FALSE, NOW()),
+('tl03','t2','ly1',TRUE, NOW()), ('tl04','t2','ly3',FALSE, NOW()), ('tl05','t2','ly4',FALSE, NOW()),
+('tl06','t3','ly5',TRUE, NOW()),
+('tl07','t4','ly1',TRUE, NOW()), ('tl08','t4','ly2',FALSE, NOW());
+-- t5 API服务无排版关联
+```
+
+#### 10.2.12 功能管理 `t_feature`
+
+```sql
+-- 根节点
+INSERT INTO t_feature (id, parent_id, feature_name, feature_key, description, icon, sort_order, status, created_at, updated_at) VALUES
+('f1',  NULL, '系统管理', 'SYS_MANAGEMENT', '系统级管理功能集合',         'setting',     1, 'ACTIVE', NOW(), NOW()),
+('f7',  NULL, '商品中心', 'PRODUCT_CENTER',  '商品相关功能集合',           'shop',        2, 'ACTIVE', NOW(), NOW()),
+('f13', NULL, '交易管理', 'TRADE_CENTER',    '订单、购物车、支付相关',       'transaction', 3, 'ACTIVE', NOW(), NOW()),
+('f17', NULL, '数据分析', 'DATA_ANALYTICS',  '数据报表与可视化分析',        'chart',       4, 'ACTIVE', NOW(), NOW()),
+('f20', NULL, '内容管理', 'CMS_CENTER',      '文章、内容发布与管理',        'file-text',   5, 'ACTIVE', NOW(), NOW());
+
+-- 系统管理子节点
+INSERT INTO t_feature (id, parent_id, feature_name, feature_key, description, icon, sort_order, status, created_at, updated_at) VALUES
+('f2', 'f1', '用户管理',  'USER_MANAGEMENT', '用户增删改查及状态管理',     'user',    1, 'ACTIVE', NOW(), NOW()),
+('f5', 'f1', '角色管理',  'ROLE_MANAGEMENT', '角色创建、编辑、权限分配',   'team',    2, 'ACTIVE', NOW(), NOW()),
+('f6', 'f1', '权限配置',  'PERM_CONFIG',     '菜单与接口权限配置',         'safety',  3, 'ACTIVE', NOW(), NOW());
+
+INSERT INTO t_feature (id, parent_id, feature_name, feature_key, description, icon, sort_order, status, created_at, updated_at) VALUES
+('f3', 'f2', '用户列表',  'USER_LIST',       '查看、搜索、筛选用户',       'list',    1, 'ACTIVE', NOW(), NOW()),
+('f4', 'f2', '用户详情',  'USER_DETAIL',     '查看用户详细信息',            'profile', 2, 'ACTIVE', NOW(), NOW());
+
+-- 商品中心子节点
+INSERT INTO t_feature (id, parent_id, feature_name, feature_key, description, icon, sort_order, status, created_at, updated_at) VALUES
+('f8',  'f7', '商品管理', 'PRODUCT_MGMT',    '商品CRUD、分类、SKU管理',    'box',      1, 'ACTIVE', NOW(), NOW()),
+('f12', 'f7', '库存管理', 'INVENTORY_MGMT',  '库存查询、出入库记录',       'database', 2, 'ACTIVE', NOW(), NOW());
+
+INSERT INTO t_feature (id, parent_id, feature_name, feature_key, description, icon, sort_order, status, created_at, updated_at) VALUES
+('f9',  'f8', '商品列表', 'PRODUCT_LIST',    '商品分页列表展示',            'list', 1, 'ACTIVE',  NOW(), NOW()),
+('f10', 'f8', '商品分类', 'PRODUCT_CATEGORY','商品分类树管理',              'tree', 2, 'ACTIVE',  NOW(), NOW()),
+('f11', 'f8', '商品标签', 'PRODUCT_TAG',     '商品标签管理',               'tag',  3, 'DISABLED',NOW(), NOW());
+
+-- 交易管理子节点
+INSERT INTO t_feature (id, parent_id, feature_name, feature_key, description, icon, sort_order, status, created_at, updated_at) VALUES
+('f14', 'f13', '订单管理', 'ORDER_MGMT',      '订单创建、流转、售后处理',   'order',      1, 'ACTIVE', NOW(), NOW()),
+('f15', 'f13', '购物车',   'SHOPPING_CART',   '购物车管理、凑单推荐',      'cart',       2, 'ACTIVE', NOW(), NOW()),
+('f16', 'f13', '支付管理', 'PAYMENT_MGMT',    '支付集成与流水管理',         'pay-circle', 3, 'ACTIVE', NOW(), NOW());
+
+-- 数据分析子节点
+INSERT INTO t_feature (id, parent_id, feature_name, feature_key, description, icon, sort_order, status, created_at, updated_at) VALUES
+('f18', 'f17', '数据看板', 'DASHBOARD',       '关键指标可视化图表',         'dashboard', 1, 'ACTIVE', NOW(), NOW()),
+('f19', 'f17', '数据导出', 'DATA_EXPORT',     'Excel/CSV数据导出',          'export',    2, 'ACTIVE', NOW(), NOW());
+
+-- 内容管理子节点
+INSERT INTO t_feature (id, parent_id, feature_name, feature_key, description, icon, sort_order, status, created_at, updated_at) VALUES
+('f21', 'f20', '文章管理', 'ARTICLE_MGMT',    '文章发布、编辑、分类',       'edit',     1, 'ACTIVE',  NOW(), NOW()),
+('f22', 'f20', '评论审核', 'COMMENT_REVIEW',  '评论审核与举报处理',         'message',  2, 'DISABLED',NOW(), NOW());
+```
+
+#### 10.2.13 功能-模板关联 `t_feature_template`
+
+```sql
+INSERT INTO t_feature_template (id, feature_id, template_id, created_at) VALUES
+-- 系统管理关联
+('ft01','f1','t1',NOW()),('ft02','f1','t2',NOW()),
+('ft03','f2','t1',NOW()),('ft04','f2','t2',NOW()),
+('ft05','f3','t1',NOW()),
+('ft06','f4','t1',NOW()),
+('ft07','f5','t1',NOW()),('ft08','f5','t2',NOW()),
+('ft09','f6','t1',NOW()),
+-- 商品中心关联
+('ft10','f7','t1',NOW()),('ft11','f7','t3',NOW()),
+('ft12','f8','t1',NOW()),('ft13','f8','t3',NOW()),
+('ft14','f9','t1',NOW()),
+('ft15','f10','t1',NOW()),
+('ft16','f12','t1',NOW()),
+-- 交易管理关联
+('ft17','f13','t1',NOW()),('ft18','f13','t3',NOW()),
+('ft19','f14','t1',NOW()),('ft20','f14','t3',NOW()),
+('ft21','f15','t1',NOW()),
+('ft22','f16','t1',NOW()),('ft23','f16','t3',NOW()),
+-- 数据分析关联
+('ft24','f17','t2',NOW()),
+('ft25','f18','t2',NOW()),
+('ft26','f19','t2',NOW()),
+-- 内容管理关联
+('ft27','f20','t4',NOW()),
+('ft28','f21','t4',NOW());
+-- f11(feature:商品标签) 和 f22(feature:评论审核) 无关联模板
+```
+
+#### 10.2.14 AI提示词模板 `t_prompt_template`
+
+```sql
+INSERT INTO t_prompt_template (id, template_key, template_name, node_type, system_prompt, user_prompt, variables, version, is_default, created_at, updated_at) VALUES
+('p1', 'requirement_parser',  '需求解析提示词',   'REQUIREMENT_PARSING',   '你是一个资深的需求分析师，擅长将用户的自然语言需求转化为结构化的功能需求列表。', '分析以下用户需求：\n{{requirement}}', '[{"name":"requirement","type":"string","required":true}]', 'v1.0', TRUE, NOW(), NOW()),
+('p2', 'prd_generator',      'PRD生成提示词',    'DOC_GENERATING',        '你是一个专业的PRD文档撰写者，根据结构化需求生成符合行业标准的产品需求文档。', '为以下功能需求生成PRD文档章节：\n{{modules_json}}', '[{"name":"modules_json","type":"json","required":true}]', 'v1.0', TRUE, NOW(), NOW()),
+('p3', 'prototype_generator','原型生成提示词',   'PROTOTYPE_GENERATING', '你是一个资深的前端设计师，根据PRD文档生成可交互的HTML产品原型。', '基于以下PRD章节设计产品原型：\n{{prd_sections}}', '[{"name":"prd_sections","type":"json","required":true}]', 'v1.0', TRUE, NOW(), NOW()),
+('p4', 'ui_designer',        'UI设计提示词',     'UI_DESIGNING',          '你是一个UI/UX设计师，根据原型和设计规范生成专业的UI设计稿。', '基于原型和设计令牌生成UI：\n原型：{{prototype}}\n令牌：{{tokens}}', '[{"name":"prototype","type":"text"},{"name":"tokens","type":"json"}]', 'v1.0', TRUE, NOW(), NOW()),
+('p5', 'tech_planner',       '技术方案提示词',   'TECH_PLAN_GENERATING', '你是一个资深技术架构师，根据PRD和原型生成技术方案与执行计划。', '根据以下输入设计技术方案：\nPRD：{{prd}}\n技术栈：{{tech_stack}}', '[{"name":"prd","type":"text"},{"name":"tech_stack","type":"json"}]', 'v1.0', TRUE, NOW(), NOW()),
+('p6', 'code_generator',     '代码生成提示词',   'CODE_GENERATING',      '你是一个资深后端/前端开发工程师，根据技术方案生成项目初始化代码。', '生成项目代码：\n方案：{{tech_plan}}\n模板：{{template}}', '[{"name":"tech_plan","type":"text"},{"name":"template","type":"text"}]', 'v1.0', TRUE, NOW(), NOW()),
+('p7', 'prd_updater',        'PRD增量更新提示词','DOC_UPDATING',          '你是一个PRD文档编辑者，根据用户的修改意见增量更新PRD文档，保持未修改部分的完整性。', '原PRD：\n{{current_prd}}\n\n修改意见：\n{{feedback}}', '[{"name":"current_prd","type":"text"},{"name":"feedback","type":"text"}]', 'v1.0', TRUE, NOW(), NOW()),
+('p8', 'prototype_updater',  '原型增量更新提示词','PROTOTYPE_UPDATING',  '你是一个前端原型设计师，根据用户的修改意见增量更新HTML原型。', '当前原型：\n{{current_prototype}}\n修改意见：\n{{feedback}}', '[{"name":"current_prototype","type":"text"},{"name":"feedback","type":"text"}]', 'v1.0', TRUE, NOW(), NOW()),
+('p9', 'ui_updater',         'UI增量更新提示词',  'UI_DESIGN_UPDATING',  '你是一个UI设计师，根据用户的样式修改意见增量更新UI设计稿。', '当前UI：{{current_ui}}\n令牌：{{tokens}}\n修改意见：{{feedback}}', '[{"name":"current_ui","type":"text"},{"name":"tokens","type":"json"},{"name":"feedback","type":"text"}]', 'v1.0', TRUE, NOW(), NOW());
+```
+
+#### 10.2.15 LLM模型配置 `t_model_config`
+
+```sql
+INSERT INTO t_model_config (id, model_name, provider, api_key_encrypted, api_base_url, default_temperature, max_tokens, is_active, priority, created_at, updated_at) VALUES
+('mc1', 'deepseek-v3',   'deepseek',  'ENC::base64placeholder::', 'https://api.deepseek.com/v1',         0.7, 4096, TRUE,  10, NOW(), NOW()),
+('mc2', 'gpt-4o',        'openai',    'ENC::base64placeholder::', 'https://api.openai.com/v1',           0.7, 4096, TRUE,   5, NOW(), NOW()),
+('mc3', 'claude-sonnet', 'anthropic', 'ENC::base64placeholder::', 'https://api.anthropic.com',           0.7, 4096, FALSE,  0, NOW(), NOW());
+```
+
+---
+
+### 10.3 后端模块划分
+
+```
+pick-up-project/
+├── pick-up-common/          // 【模块A：公共基础设施】
+├── pick-up-domain/          // 【模块B：领域模型】
+├── pick-up-security/        // 【模块C：认证鉴权】
+├── pick-up-service/         // 【模块D：核心业务服务】
+├── pick-up-ai-engine/       // 【模块E：AI 工作流引擎】
+└── pick-up-api/             // 【模块F：Web API 入口】
+```
+
+| 模块 | 包路径 | 职责 | 依赖 |
+|------|--------|------|------|
+| **A** `pick-up-common` | `com.pickup.common` | 统一响应体、异常定义、工具类、常量枚举、基础配置 | 无 |
+| **B** `pick-up-domain` | `com.pickup.domain` | Entity、DTO/VO、Repository 接口、Service 接口 | A |
+| **C** `pick-up-security` | `com.pickup.security` | JWT 认证、Spring Security 配置、权限注解、Token 黑名单 | A, B |
+| **D** `pick-up-service` | `com.pickup.service` | Service 实现、业务逻辑编排、事务管理 | A, B, C |
+| **E** `pick-up-ai-engine` | `com.pickup.ai` | Langgraph4j 工作流、Langchain4j Agent、SSE 推送、LLM 调用 | A, B |
+| **F** `pick-up-api` | `com.pickup.api` | REST Controller、SSE 端点、全局异常处理、Swagger 文档 | A, B, C, D, E |
+
+---
+
+### 10.4 后端模块详细设计
+
+#### 10.4.1 模块A `pick-up-common`：公共基础设施
+
+| 包 | 内容 | 说明 |
+|----|------|------|
+| `common.response` | `ApiResponse<T>`, `PageResult<T>` | 统一响应体，包含 `code`/`message`/`data`/`timestamp`/`traceId` |
+| `common.exception` | `BusinessException`, `ErrorCode` 枚举 | 业务异常体系，含 HTTP 状态码+业务错误码 |
+| `common.constant` | `OrderConstants`, `ProjectConstants`, `CacheConstants` | 按域分组的常量类，替代魔法值 |
+| `common.enums` | `ProjectStatus`, `StageStatus`, `DeliverableType`, `DomainType` | 全系统共享枚举 |
+
+**ErrorCode 枚举**：
+
+```java
+public enum ErrorCode {
+    SUCCESS(200, "成功"),
+    BAD_REQUEST(400, "参数错误"),
+    UNAUTHORIZED(401, "未认证"),
+    FORBIDDEN(403, "无权限"),
+    NOT_FOUND(404, "资源不存在"),
+    CONFLICT(409, "数据冲突"),
+    RATE_LIMITED(429, "请求过于频繁"),
+    INTERNAL_ERROR(500, "服务器内部错误"),
+    AI_CALL_FAILED(100001, "AI 调用失败"),
+    WORKFLOW_FAILED(100002, "工作流执行失败"),
+    CODE_GEN_FAILED(100003, "代码生成失败"),
+    QUOTA_EXCEEDED(100004, "配额不足"),
+    FILE_STORAGE_FAILED(100005, "文件存储失败"),
+    // v1.4 新增
+    VERSION_CONFLICT(100006, "版本冲突"),
+    PREVIEW_NOT_READY(100007, "预览未就绪"),
+    FEEDBACK_PROCESSING(100008, "修改意见处理中"),
+    STAGE_ALREADY_CONFIRMED(100009, "该阶段已确认，不可重复操作");
+}
+```
+
+#### 10.4.2 模块B `pick-up-domain`：领域模型
+
+**Entity 类**（均实现 `Serializable`，无内部类）：
+
+| Entity | 对应表 | 关键字段 |
+|--------|--------|----------|
+| `User` | `t_user` | id, username, email, passwordHash, status, monthlyQuota, usedQuota |
+| `Project` | `t_project` | id, userId, name, requirementText, status, currentStage, templateId, selectedModules |
+| `WorkflowStage` | `t_workflow_stage` | id, projectId, stageName, status, outputData |
+| `Deliverable` | `t_deliverable` | id, projectId, deliverableType, version, filePath, confirmed |
+| `Menu` | `t_menu` | id, parentId, name, type, path, permission, sortOrder |
+| `Role` | `t_role` | id, name, code, status, isSystem |
+| `FunctionModule` | `t_function_module` | id, moduleName, moduleKey, domain, isCore |
+| `LayoutRule` | `t_layout_rule` | id, layoutName, layoutType, configJson |
+| `ProjectTemplate` | `t_project_template` | id, templateName, templateCode, category, techStack |
+| `Feature` | `t_feature` | id, parentId, featureName, featureKey, status |
+| `DeliverableVersion` | `t_deliverable_version` | id, deliverableId, version, contentText, triggerType |
+| `DeliverableFeedback` | `t_deliverable_feedback` | id, projectId, deliverableId, feedbackContent, status |
+| `WorkflowSubtask` | `t_workflow_subtask` | id, stageId, taskName, status, outputFiles |
+| `DeliverableChangeLog` | `t_deliverable_change_log` | id, versionId, changePosition, changeType, changeContent |
+| `WorkflowPreviewState` | `t_workflow_preview_state` | id, projectId, stageName, previewStatus |
+
+**Repository 接口**：
+
+| Repository | 数据源 | 说明 |
+|------------|--------|------|
+| `UserRepository` | PostgreSQL | 用户 CRUD，扩展 JpaSpecificationExecutor |
+| `ProjectRepository` | PostgreSQL | 项目分页查询、按状态/用户筛选 |
+| `WorkflowStageRepository` | PostgreSQL | 按 projectId 排序查询阶段列表 |
+| `DeliverableRepository` | PostgreSQL | 按 projectId+type 查询交付物 |
+| `MenuRepository` | PostgreSQL | 全量查询构建菜单树 |
+| `RoleRepository` | PostgreSQL | 角色 CRUD + 按code查询 |
+| `FunctionModuleRepository` | PostgreSQL | 按 domain 筛选 |
+| `LayoutRuleRepository` | PostgreSQL | 按 type 筛选 |
+| `ProjectTemplateRepository` | PostgreSQL | 按 category 筛选 |
+| `FeatureRepository` | PostgreSQL | 按 parentId 递归查询 |
+| `DeliverableVersionRepository` | PostgreSQL | 按 deliverableId 排序查版本链 |
+| `DeliverableFeedbackRepository` | PostgreSQL | 按状态/pending 查询待处理意见 |
+| `WorkflowSubtaskRepository` | PostgreSQL | 按 stageId 查询子任务列表 |
+| `DeliverableChangeLogRepository` | PostgreSQL | 按 versionId 查询变更记录 |
+
+#### 10.4.3 模块C `pick-up-security`：认证鉴权
+
+| 包 | 内容 | 说明 |
+|----|------|------|
+| `security.jwt` | `JwtTokenProvider`, `JwtAuthenticationFilter` | 生成/验证 JWT Token + 请求拦截 |
+| `security.config` | `SecurityConfig`, `CorsConfig` | Spring Security 配置链 |
+| `security.annotation` | `@RequirePermission` | 方法级权限注解 |
+| `security.service` | `UserDetailsServiceImpl` | 加载用户+角色+权限 |
+
+**认证流程**：
+
+```
+POST /api/v1/auth/login
+    → AuthController.login()
+    → AuthService.authenticate(username, password)
+    → BCrypt 密码校验
+    → 查询用户角色列表 → 查询角色菜单 → 查询角色API
+    → JwtTokenProvider.generate( userId, roles, permissions )
+    → 返回 { accessToken, refreshToken, expiresIn, user }
+```
+
+**鉴权流程**：
+
+```
+每个请求
+    → JwtAuthenticationFilter.doFilter()
+    → 解析 Header: Authorization: Bearer {token}
+    → 校验 Token 有效期 + 黑名单
+    → 将 roles + permissions 写入 SecurityContext
+    → @RequirePermission("project:create") 注解拦截
+    → 匹配 API 路径权限（t_role_api）
+```
+
+#### 10.4.4 模块D `pick-up-service`：核心业务服务
+
+**Service 接口与实现清单**：
+
+| 模块域 | Service 接口 | 实现类 | 职责 |
+|--------|-------------|--------|------|
+| 项目管理 | `ProjectService` | `ProjectServiceImpl` | 创建项目（三步向导）、分页列表、详情、状态流转 |
+| 交付物 | `DeliverableService` | `DeliverableServiceImpl` | 预览、版本管理、回退、确认推进 |
+| 工作流预览 | `WorkflowPreviewService` | `WorkflowPreviewServiceImpl` | 预览状态管理、变更展示、确认/撤回 |
+| 反馈处理 | `FeedbackService` | `FeedbackServiceImpl` | 提交修改意见、AI增量更新触发、处理后回调 |
+| 用户管理 | `UserService` | `UserServiceImpl` | 用户CRUD、配额管理、角色绑定 |
+| 菜单管理 | `MenuService` | `MenuServiceImpl` | 菜单树构建、CRUD、排序调整 |
+| 角色管理 | `RoleService` | `RoleServiceImpl` | 角色CRUD、菜单/API权限分配 |
+| 模板管理 | `TemplateService` | `TemplateServiceImpl` | 模板CRUD、功能项/排版关联、复制 |
+| 功能项库 | `ModuleService` | `ModuleServiceImpl` | 功能模块CRUD、批量导入导出 |
+| 排版规则库 | `LayoutService` | `LayoutServiceImpl` | 排版规则CRUD、预览HTML生成 |
+| 功能管理 | `FeatureService` | `FeatureServiceImpl` | 功能树构建、批量启停、批量移动 |
+| 统计 | `StatsService` | `StatsServiceImpl` | 系统概览、Agent调用统计 |
+
+---
+
+### 10.5 后端业务流程执行方案（按模块）
+
+#### 10.5.1 项目创建流程
+
+```
+POST /api/v1/projects
+  │
+  ├── Controller: ProjectController.create(request, user)
+  │     └── @Valid 触发 Jakarta Validation
+  │     └── @RequirePermission("project:create")
+  │
+  ├── Service: ProjectServiceImpl.createProject()
+  │     ├── 1. 校验用户配额（monthlyQuota - usedQuota > 0）
+  │     ├── 2. 校验模板存在且启用
+  │     ├── 3. 校验必选模块完整性
+  │     ├── 4. 构建 Project 实体
+  │     │      templateId, layoutId, selectedModules (JSONB)
+  │     │      status=TEMPLATE_SELECTING
+  │     ├── 5. projectRepository.save()
+  │     ├── 6. 创建 WorkflowStage 记录（按 stages 配置）
+  │     ├── 7. userRepository.incrementUsedQuota()
+  │     ├── 8. CompletableFuture.runAsync() 启动AI工作流
+  │     └── 9. 返回 ProjectResponse
+  │
+  └── AI Engine: WorkflowExecutor.execute(projectId, request)
+        └── 参见 10.5.5 工作流执行流程
+```
+
+#### 10.5.2 工作流预览-确认流程（v1.4 核心）
+
+```
+【AI完成生成 → 通知用户预览】
+
+    AI Engine 完成后
+      │
+      ├── updateProjectStatus(DOC_PREVIEWING)
+      ├── createDeliverableVersion( v1.0, content, changeSummary )
+      ├── createChangeLog( versionId, [{changePosition, changeType, changeContent}] )
+      ├── createWorkflowSubtask( stageId, tasks[] )
+      ├── createPreviewState( DOC_GENERATING, PREVIEWING, v1.0 )
+      └── SSE push: preview:ready
+
+【用户在预览界面操作】
+
+  ┌── 用户输入修改意见 ──────────────────────────────────┐
+  │                                                     │
+  │  POST /api/v1/deliverables/{projectId}/prd/feedback │
+  │    → FeedbackService.submitFeedback()               │
+  │    → createFeedback( PENDING )                      │
+  │    → updatePreviewState( UPDATING )                 │
+  │    → SSE push: update:start                         │
+  │    → 调用 AI Engine 增量更新                         │
+  │    → isUpdated:                                     │
+  │        ├── createNewVersion( v1.1 )                 │
+  │        ├── createChangeLog( diffEntries )           │
+  │        ├── updateFeedback( COMPLETED )              │
+  │        ├── updatePreviewState( PREVIEWING, v1.1 )   │
+  │        └── SSE push: update:complete                │
+  └─────────────────────────────────────────────────────┘
+
+  ┌── 用户点击「确认变更」 ─────────────────────────────┐
+  │                                                     │
+  │  POST /api/v1/deliverables/{projectId}/prd/confirm  │
+  │    → PreviewService.confirmStage()                  │
+  │    → validateStageNotConfirmed()                    │
+  │    → updateDeliverable( confirmed=TRUE )            │
+  │    → updatePreviewState( CONFIRMED )                │
+  │    → SSE push: phase:confirmed                      │
+  │    → 自动触发下一阶段工作流                          │
+  └─────────────────────────────────────────────────────┘
+
+  ┌── 用户点击「撤回」 ────────────────────────────────┐
+  │                                                     │
+  │  POST /api/v1/deliverables/{projectId}/prd/rollback │
+  │    → PreviewService.revertStage()                   │
+  │    → 获取上一个 confirmed 版本                      │
+  │    → restoreDeliverableToVersion( prevVersion )     │
+  │    → updatePreviewState( REVERTED )                 │
+  │    → incrementRevertCount()                         │
+  └─────────────────────────────────────────────────────┘
+
+  ┌── 用户点击「跳过预览」 ────────────────────────────┐
+  │                                                     │
+  │    → 等同于 confirm，但不标记版本为已确认           │
+  │    → 直接推进至下一阶段                             │
+  └─────────────────────────────────────────────────────┘
+```
+
+#### 10.5.3 菜单管理-树构建流程
+
+```
+GET /api/v1/admin/menus
+  │
+  ├── Controller: MenuController.getTree()
+  │     └── @RequirePermission("menu:view")
+  │
+  ├── Service: MenuServiceImpl.getMenuTree()
+  │     ├── 1. menuRepository.findAll( Sort.by("sortOrder") )
+  │     ├── 2. 内存构建树形结构
+  │     │      └── Map<parentId, List<Menu>> → 递归组装 children
+  │     ├── 3. 缓存到 Redis: menu:tree:all (TTL=1h)
+  │     └── 4. 返回 MenuTreeNode[]
+  │
+  └── POST/PUT/DELETE 后清除 Redis 缓存
+
+GET /api/v1/auth/menus (用户菜单)
+  │
+  ├── 获取当前用户角色 → 查询 role_menu → 过滤可见菜单
+  ├── 仅返回 visible=TRUE 且用户角色有权限的节点
+  └── 缓存: menu:tree:{userId}
+```
+
+#### 10.5.4 角色权限分配流程
+
+```
+PUT /api/v1/admin/roles/{id}/menus
+  │
+  ├── Controller: RoleController.assignMenus( roleId, { menuIds: [...] } )
+  │     └── @RequirePermission("role:assign")
+  │
+  └── Service: RoleServiceImpl.assignMenus()
+        ├── 1. @Transactional
+        ├── 2. 校验角色存在
+        ├── 3. DELETE FROM t_role_menu WHERE role_id = ?
+        ├── 4. INSERT INTO t_role_menu (批量)
+        ├── 5. 清除 Redis: menu:tree:{allUsers}, role:menus:{roleId}
+        ├── 6. 清除受影响用户的权限缓存
+        └── 7. 返回成功
+
+PUT /api/v1/admin/roles/{id}/apis (同理)
+```
+
+#### 10.5.5 AI 工作流执行流程
+
+```
+【触发】创建项目 / 确认阶段后自动推进
+
+WorkflowExecutor.execute(projectId, CreateProjectRequest)
+  │
+  ├── 1. 加载 WorkflowState（从 Redis 或新建）
+  ├── 2. 按 stages 顺序遍历节点
+  │     │
+  │     ├── 【节点 - REQUIREMENT_PARSING】需求解析
+  │     │     ├── Agent: RequirementParserAgent
+  │     │     ├── Tools: ES 相似项目检索 + 历史模板匹配
+  │     │     ├── LLM: 调用 prompt_template('requirement_parser')
+  │     │     ├── 输出: structuredRequirement (JSON)
+  │     │     └── SSE push: stage:progress → stage:complete
+  │     │
+  │     ├── 【节点 - DOC_GENERATING】PRD生成
+  │     │     ├── Agent: DocGenerationAgent
+  │     │     ├── LLM: 调用 prompt_template('prd_generator')
+  │     │     ├── 输出: PRD Markdown 文档
+  │     │     ├── 创建 Deliverable + DeliverableVersion(v1.0)
+  │     │     ├── 创建 ChangeLog（6条变更记录）
+  │     │     ├── 创建 WorkflowSubtask（6条子任务）
+  │     │     ├── 创建 PreviewState( PREVIEWING )
+  │     │     └── SSE push: preview:ready → 等待用户操作
+  │     │
+  │     │  【等待用户确认/修改/撤回】← 预览界面操作
+  │     │
+  │     ├── 【节点 - PROTOTYPE_GENERATING】原型生成
+  │     │     └── (同理) Agent + LLM → 生成HTML原型 → 等待确认
+  │     │
+  │     ├── 【节点 - UI_DESIGNING】UI设计
+  │     │     └── (同理) Agent + LLM → 生成UI设计稿 → 等待确认
+  │     │
+  │     ├── 【节点 - TECH_PLAN_GENERATING】技术方案
+  │     │     └── Agent + LLM → 生成技术方案文档
+  │     │
+  │     ├── 【节点 - PLAN_INTEGRATING】方案整合
+  │     │     └── 合并技术方案+PRD+原型 → 生成执行计划
+  │     │
+  │     ├── 【节点 - CODE_GENERATING】代码生成
+  │     │     └── Agent + LLM + FileWriter → 生成项目源码
+  │     │
+  │     └── 【节点 - COMPLETED】完成
+  │           └── SSE push: workflow:complete
+  │
+  └── 异常处理
+        ├── 可重试异常 → node.retry() → 最多3次
+        └── 不可恢复 → markStageFailed() → SSE push: stage:error
+```
+
+#### 10.5.6 SSE 推送实现方案
+
+```
+Controller: WorkflowController.stream(projectId)
+  │
+  ├── 返回 SseEmitter(TIMEOUT=30min)
+  ├── 注册到 SseEmitterManager (ConcurrentHashMap<projectId, List<SseEmitter>>)
+  │
+  └── WorkflowExecutor 在节点变更时
+        ├── SseEmitterManager.send(projectId, eventType, data)
+        │     ├── 遍历该 projectId 的所有 SseEmitter
+        │     ├── emitter.send( SseEmitter.event().name(eventType).data(json) )
+        │     └── 失败 → 移除该 emitter
+        └── 支持的 eventType:
+              stage:start | stage:progress | stage:complete | stage:error
+              preview:ready | update:start | update:complete
+              phase:confirmed | workflow:complete | clarification:needed
+```
+
+---
+
+### 10.6 接口路由映射表（按模块）
+
+#### 10.6.1 认证模块
+
+| METHOD | PATH | 权限 | Controller 方法 | Service 方法 | 说明 |
+|--------|------|------|-----------------|-------------|------|
+| POST | `/api/v1/auth/login` | 无 | `AuthController.login()` | `AuthService.authenticate()` | 用户登录 |
+| POST | `/api/v1/auth/refresh` | 无 | `AuthController.refresh()` | `AuthService.refreshToken()` | 刷新Token |
+| POST | `/api/v1/auth/logout` | 已认证 | `AuthController.logout()` | `AuthService.logout()` | 登出 |
+| GET | `/api/v1/auth/me` | 已认证 | `AuthController.me()` | `AuthService.getCurrentUser()` | 当前用户信息 |
+| GET | `/api/v1/auth/menus` | 已认证 | `AuthController.menus()` | `MenuService.getUserMenuTree()` | 用户菜单树 |
+
+#### 10.6.2 项目管理模块
+
+| METHOD | PATH | 权限 | Controller 方法 | Service 方法 | 说明 |
+|--------|------|------|-----------------|-------------|------|
+| POST | `/api/v1/projects` | `project:create` | `ProjectController.create()` | `ProjectService.createProject()` | 创建项目 |
+| GET | `/api/v1/projects` | `project:view` | `ProjectController.list()` | `ProjectService.listProjects()` | 项目列表 |
+| GET | `/api/v1/projects/{id}` | `project:view` | `ProjectController.detail()` | `ProjectService.getDetail()` | 项目详情 |
+| PUT | `/api/v1/projects/{id}` | `project:edit` | `ProjectController.update()` | `ProjectService.update()` | 更新项目 |
+| DELETE | `/api/v1/projects/{id}` | `project:delete` | `ProjectController.delete()` | `ProjectService.delete()` | 删除项目 |
+| POST | `/api/v1/projects/{id}/retry` | `project:edit` | `ProjectController.retry()` | `ProjectService.retry()` | 重试失败 |
+
+#### 10.6.3 交付物预览-修改-确认模块（v1.4）
+
+| METHOD | PATH | 权限 | Controller 方法 | Service 方法 | 说明 |
+|--------|------|------|-----------------|-------------|------|
+| GET | `/api/v1/deliverables/{id}/prd` | `project:view` | `DeliverableController.getPrd()` | `DeliverableService.getPrd()` | 预览PRD |
+| GET | `/api/v1/deliverables/{id}/prd/versions` | `project:view` | `DeliverableController.getVersions()` | `DeliverableVersionService.listVersions()` | 版本历史 |
+| POST | `/api/v1/deliverables/{id}/prd/feedback` | `project:edit` | `DeliverableController.submitFeedback()` | `FeedbackService.submitFeedback()` | 提交修改意见 |
+| POST | `/api/v1/deliverables/{id}/prd/rollback` | `project:edit` | `DeliverableController.rollback()` | `PreviewService.rollbackToVersion()` | 回退版本 |
+| POST | `/api/v1/deliverables/{id}/prd/confirm` | `project:edit` | `DeliverableController.confirmPrd()` | `PreviewService.confirmStage()` | 确认推进 |
+| GET | `/api/v1/deliverables/{id}/changes` | `project:view` | `DeliverableController.getChanges()` | `DeliverableChangeLogService.listChanges()` | 变更记录 |
+| GET | `/api/v1/deliverables/{id}/subtasks` | `project:view` | `DeliverableController.getSubtasks()` | `WorkflowSubtaskService.listByStage()` | 子任务列表 |
+
+#### 10.6.4 工作流模块
+
+| METHOD | PATH | 权限 | Controller 方法 | 说明 |
+|--------|------|------|-----------------|------|
+| GET | `/api/v1/workflow/{id}/status` | `project:view` | `WorkflowController.status()` | 轮询状态 |
+| GET | `/api/v1/workflow/{id}/stream` | `project:view` | `WorkflowController.stream()` | SSE 实时推送 |
+| GET | `/api/v1/workflow/{id}/preview-state` | `project:view` | `WorkflowController.previewState()` | 预览状态 |
+
+#### 10.6.5 模板与配置模块（普通用户）
+
+| METHOD | PATH | 权限 | 说明 |
+|--------|------|------|------|
+| GET | `/api/v1/templates` | 已认证 | 可用模板列表（仅启用） |
+| GET | `/api/v1/templates/{id}` | 已认证 | 模板详情 |
+| GET | `/api/v1/templates/{id}/modules` | 已认证 | 模板关联功能项 |
+| GET | `/api/v1/templates/{id}/layouts` | 已认证 | 模板关联排版方案 |
+| GET | `/api/v1/modules/available` | 已认证 | 可选功能项库 |
+| GET | `/api/v1/layouts/available` | 已认证 | 可选排版规则库 |
+
+#### 10.6.6 管理后台模块
+
+| METHOD | PATH | 权限标识 |
+|--------|------|----------|
+| GET/POST/PUT/DELETE | `/api/v1/admin/users/**` | `user:view/write` |
+| GET/POST/PUT/DELETE | `/api/v1/admin/menus/**` | `menu:view/create/edit/delete` |
+| GET/POST/PUT/DELETE | `/api/v1/admin/roles/**` | `role:view/write` |
+| GET/POST/PUT/DELETE | `/api/v1/admin/templates/**` | `template:view/write` |
+| GET/POST/PUT/DELETE | `/api/v1/admin/modules/**` | `module:view/write` |
+| GET/POST/PUT/DELETE | `/api/v1/admin/layouts/**` | `layout:view/write` |
+| GET/POST/PUT/DELETE | `/api/v1/admin/features/**` | `feature:view/write` |
+| GET | `/api/v1/admin/stats/**` | `stats:view` |
+
+---
+
+### 10.7 事务边界与异步处理约定
+
+| 场景 | 策略 | 说明 |
+|------|------|------|
+| 项目创建 | 同步保存实体 + 异步启动工作流 | `CompletableFuture.runAsync()` 避免阻塞 HTTP 响应 |
+| 角色权限分配 | 全量覆盖式事务 | `DELETE + INSERT` 同一事务，失败回滚 |
+| 菜单排序 | 批量 UPDATE 事务 | 同父级下所有兄弟节点的 sort_order 一次性重算 |
+| AI 增量更新 | 异步处理 | 提交反馈后立即返回，AI 处理完成后 SSE 推送结果 |
+| 交付物版本创建 | 同步事务 | 版本创建与变更日志在同一事务中（确保一致性） |
+| SSE 连接 | 长连接管理 | SseEmitter 超时 30min，断开自动清理注册 |
+
+---
+
+> **下一步开发顺序**：模块A(common) → 模块B(domain + DDL 建表) → 模块D(运行 DML 种子数据) → 模块C(security) → 模块F(api) → 模块E(ai-engine)
+
+
+
+## 十一、模块化执行方案（前后端 + SQL 设计）
+
+> **说明**：本章将系统拆分为 7 大业务模块，逐模块给出「SQL 设计 → 前端执行方案 → 后端执行方案」的完整开发蓝图。每个模块均可独立开发与测试，按编号顺序逐步交付。
+
+**模块交付顺序**：M1 认证鉴权 → M2 项目管理 → M3 工作流预览与交付物 → M4 模板管理 → M5 系统管理 → M6 AI 工作流引擎 → M7 数据看板
+
+---
+
+### 11.0 全局基础：项目初始化 SQL
+
+> 以下为创建数据库、安装扩展的初始化脚本，最先执行。
+
+```sql
+-- 创建数据库
+CREATE DATABASE pickup_db
+    WITH ENCODING 'UTF8'
+         LC_COLLATE = 'en_US.UTF-8'
+         LC_CTYPE = 'en_US.UTF-8'
+         TEMPLATE template0;
+
+-- 连接后安装扩展
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+```
+
+---
+
+### 11.1 【M1】认证鉴权模块
+
+> **依赖**：无（最先交付的基础模块）
+> **涉及表**：`t_user`、`t_role`、`t_user_role`、`t_login_log`
+> **关键文件**：`pick-up-security` 模块
+
+#### 11.1.1 SQL 设计
+
+**涉及表清单**：
+
+| 表名 | 职责 | DDL 位置 |
+|------|------|----------|
+| `t_user` | 用户账户与配额 | §6.2.1 |
+| `t_role` | 角色定义 | §6.2.6 |
+| `t_user_role` | 用户-角色关联 | §6.2.9 |
+| `t_login_log` | 登录审计日志 | §6.2.10 |
+
+**关键业务 SQL**：
+
+```sql
+-- 1. 用户登录（查询用户+角色）
+SELECT u.*, array_agg(r.code) AS role_codes
+FROM t_user u
+LEFT JOIN t_user_role ur ON u.id = ur.user_id
+LEFT JOIN t_role r ON ur.role_id = r.id
+WHERE u.username = ? OR u.email = ?
+  AND u.status = 'ACTIVE'
+GROUP BY u.id;
+
+-- 2. 登录成功：记录审计日志
+INSERT INTO t_login_log (id, user_id, ip_address, user_agent, login_type, login_status, created_at)
+VALUES (?, ?, ?, ?, 'PASSWORD', 'SUCCESS', NOW());
+
+-- 3. 登录失败：更新失败计数
+UPDATE t_user SET
+    failed_login_attempts = COALESCE(failed_login_attempts, 0) + 1,
+    last_failed_login_at = NOW(),
+    -- 连续失败5次锁定1小时
+    status = CASE WHEN COALESCE(failed_login_attempts,0) + 1 >= 5 THEN 'LOCKED' ELSE status END
+WHERE id = ?;
+
+-- 4. 查询用户配额（创建项目前校验）
+SELECT monthly_quota, used_quota FROM t_user WHERE id = ? FOR UPDATE;
+
+-- 5. 消耗配额（原子操作）
+UPDATE t_user SET used_quota = used_quota + 1 WHERE id = ? AND (monthly_quota - used_quota) > 0;
+```
+
+#### 11.1.2 前端执行方案
+
+```
+auth/                           // 认证模块目录
+├── pages/
+│   └── LoginPage.vue           // 登录页
+│       └── loginForm: { username, password, rememberMe }
+│       └── 调用 POST /api/v1/auth/login
+│
+├── components/
+│   ├── LoginForm.vue            // 登录表单组件
+│   └── ForgotPassword.vue       // 忘记密码（可选）
+│
+├── router/
+│   └── auth.guard.ts            // 路由守卫
+│       ├── router.beforeEach()  // Token 有效性检查
+│       ├── router.afterEach()   // 页面标题更新
+│       └── 无Token → 重定向 /login
+│
+├── stores/
+│   └── authStore.ts             // Pinia 认证状态
+│       ├── state: { token, refreshToken, user, roles, permissions }
+│       ├── login(username, password) → API 调用 → localStorage 存储 token
+│       ├── logout() → 清除 token → 重定向登录页
+│       ├── refreshToken() → POST /api/v1/auth/refresh
+│       └── fetchUserInfo() → GET /api/v1/auth/me
+│
+└── utils/
+    ├── axios.ts                 // Axios 实例 + 拦截器
+    │   ├── 请求拦截：自动附加 Authorization: Bearer {token}
+    │   ├── 响应拦截：401 → refreshToken → 重试 / 跳转登录
+    │   └── 响应拦截：403 → ElMessage.error("无权限")
+    └── permission.ts            // v-permission 自定义指令
+        └── binding: 无权限时移除 DOM 元素
+```
+
+**登录页组件树**：
+```
+LoginPage.vue
+├── el-card
+│   ├── Logo 区域
+│   ├── LoginForm.vue
+│   │   ├── el-input (username)
+│   │   ├── el-input (password, show-password)
+│   │   ├── el-checkbox (rememberMe)
+│   │   └── el-button (登录) → @click="handleLogin"
+│   └── ForgotPassword.vue (可选)
+```
+
+**Axios 拦截器核心实现**：
+```typescript
+// stores/authStore.ts
+export const useAuthStore = defineStore('auth', () => {
+  const token = ref(localStorage.getItem('token') || '')
+  const user = ref<UserInfo | null>(null)
+
+  async function login(username: string, password: string) {
+    const res = await api.post('/auth/login', { username, password })
+    token.value = res.data.accessToken
+    localStorage.setItem('token', res.data.accessToken)
+    localStorage.setItem('refreshToken', res.data.refreshToken)
+    await fetchUserInfo()
+    router.push('/dashboard')
+  }
+
+  async function fetchUserInfo() {
+    const res = await api.get('/auth/me')
+    user.value = res.data
+  }
+
+  function logout() {
+    token.value = ''
+    localStorage.clear()
+    router.push('/login')
+  }
+
+  return { token, user, login, logout, fetchUserInfo }
+})
+```
+
+#### 11.1.3 后端执行方案
+
+```
+【认证流程】
+
+POST /api/v1/auth/login { username, password }
+    │
+    ├── AuthController.login(@Valid @RequestBody LoginRequest)
+    │
+    ├── AuthServiceImpl.authenticate(username, password)
+    │     ├── ① userRepository.findByUsernameOrEmail(username, username)
+    │     │     └── 不存在 → throw BadCredentialsException
+    │     ├── ② BCryptPasswordEncoder.matches(password, user.passwordHash)
+    │     │     └── 不匹配 → 记录失败日志 → throw BadCredentialsException
+    │     ├── ③ 检查 user.status == ACTIVE
+    │     │     └── 锁定/禁用 → throw AccountLockedException
+    │     ├── ④ roleRepository.findByUserId(userId)
+    │     ├── ⑤ jwtTokenProvider.generate( userId, roles, expireMinutes=30 )
+    │     │     └── 签名算法 HS256，荷载: { sub, roles, iat, exp }
+    │     ├── ⑥ jwtTokenProvider.generateRefreshToken( userId, expireDays=7 )
+    │     ├── ⑦ loginLogRepository.save( AuditLog )
+    │     └── ⑧ 返回 LoginResponse { accessToken, refreshToken, expiresIn, user }
+    │
+    └── 异常 → GlobalExceptionHandler → 统一 ApiResponse
+
+【鉴权流程】
+
+每次请求
+    │
+    ├── JwtAuthenticationFilter.doFilterInternal()
+    │     ├── ① 从 Header 解析: Bearer {token}
+    │     ├── ② jwtTokenProvider.validate(token)
+    │     │     ├── 过期 → 401 UNAUTHORIZED
+    │     │     └── 黑名单检查 → Redis: blacklist:{token}
+    │     ├── ③ 提取 roles → 构建 AuthenticationToken
+    │     └── ④ SecurityContextHolder.setContext(auth)
+    │
+    ├── @RequirePermission("project:create") AOP 切面
+    │     ├── 提取当前用户角色
+    │     ├── roleApiRepository.findByRoleIds(roles)
+    │     └── AntPathMatcher.match(pattern, requestURI)
+    │           └── 不匹配 → 403 FORBIDDEN
+    │
+    └── Controller 方法执行
+```
+
+**访问安全矩阵**：
+
+| 接口路径 | 认证要求 | 权限要求 |
+|----------|----------|----------|
+| `POST /api/v1/auth/login` | 否 | 无 |
+| `POST /api/v1/auth/refresh` | 否 | 无 |
+| `GET /api/v1/auth/me` | 是 | 无 |
+| `GET /api/v1/auth/menus` | 是 | 无 |
+| 其余所有 `/api/v1/**` | 是 | 按角色-接口配置 |
+
+---
+
+### 11.2 【M2】项目管理模块
+
+> **依赖**：M1（认证鉴权）、部分 M4（模板/模块/排版查询）
+> **涉及表**：`t_project`、`t_project_template`、`t_function_module`、`t_layout_rule`、`t_template_function`、`t_template_layout`、`t_workflow_stage`
+> **关键文件**：`pick-up-service`、`pick-up-api`
+
+#### 11.2.1 SQL 设计
+
+**涉及表清单**：
+
+| 表名 | 职责 | DDL 位置 |
+|------|------|----------|
+| `t_project` | 项目主表 | §6.2.2 + §10.1.6 ALTER |
+| `t_project_template` | 项目模板 | §6.2.15 |
+| `t_function_module` | 功能模块库 | §6.2.13 |
+| `t_layout_rule` | 排版规则库 | §6.2.14 |
+| `t_template_function` | 模板-模块关联 | §6.2.16 |
+| `t_template_layout` | 模板-排版关联 | §6.2.17 |
+| `t_workflow_stage` | 工作流阶段 | §6.2.3 + §10.1.6 ALTER |
+
+**核心查询 SQL**：
+
+```sql
+-- 1. 创建项目向导-步骤1：获取可用模板列表
+SELECT t.*,
+       (SELECT json_agg(json_build_object('id', fm.id, 'moduleName', fm.module_name,
+           'moduleKey', fm.module_key, 'description', fm.description,
+           'domain', fm.domain, 'icon', fm.icon, 'isRequired', tf.is_required))
+        FROM t_template_function tf
+        JOIN t_function_module fm ON tf.module_id = fm.id
+        WHERE tf.template_id = t.id
+        ORDER BY tf.sort_order) AS modules
+FROM t_project_template t
+WHERE t.is_active = TRUE
+ORDER BY t.sort_order;
+
+-- 2. 创建项目向导-步骤2：获取模板下可选模块
+SELECT fm.id, fm.module_name, fm.module_key, fm.description, fm.icon, fm.domain,
+       tf.is_required, tf.sort_order
+FROM t_template_function tf
+JOIN t_function_module fm ON tf.module_id = fm.id
+WHERE tf.template_id = ?
+ORDER BY tf.sort_order;
+
+-- 3. 创建项目向导-步骤3：获取模板下可选排版方案
+SELECT lr.*, tl.is_default
+FROM t_template_layout tl
+JOIN t_layout_rule lr ON tl.layout_id = lr.id
+WHERE tl.template_id = ?
+ORDER BY tl.is_default DESC;
+
+-- 4. 项目列表分页（含筛选）
+SELECT p.*, pt.template_name, u.nickname AS owner_name
+FROM t_project p
+LEFT JOIN t_project_template pt ON p.template_id = pt.id
+LEFT JOIN t_user u ON p.user_id = u.id
+WHERE p.user_id = ?                       -- 按所属用户过滤
+  AND (:status IS NULL OR p.status = :status)
+  AND (:keyword IS NULL OR p.name ILIKE '%' || :keyword || '%')
+ORDER BY p.created_at DESC
+LIMIT ? OFFSET ?;
+
+-- 5. 项目详情（含阶段信息）
+SELECT p.*,
+       (SELECT json_agg(json_build_object(
+            'id', ws.id, 'stageName', ws.stage_name, 'status', ws.status,
+            'totalSubtasks', ws.total_subtasks, 'completedSubtasks', ws.completed_subtasks
+        ) ORDER BY ws.stage_order)
+        FROM t_workflow_stage ws WHERE ws.project_id = p.id) AS stages
+FROM t_project p
+WHERE p.id = ?;
+
+-- 6. 状态流转：更新项目状态
+UPDATE t_project
+SET status = ?, current_stage = ?, updated_at = NOW()
+WHERE id = ? AND status = ?;              -- 乐观锁：校验旧状态
+```
+
+**关键业务 SQL — 创建项目事务**：
+```sql
+BEGIN;
+  -- 扣减配额（悲观锁）
+  UPDATE t_user SET used_quota = used_quota + 1
+  WHERE id = ? AND (monthly_quota - used_quota) > 0
+  RETURNING (monthly_quota - used_quota) AS remaining;
+
+  -- 若剩余额度 ≤0，ROLLBACK 返回配额不足错误
+
+  -- 创建项目
+  INSERT INTO t_project (id, user_id, name, description, status, current_stage,
+       template_id, layout_id, selected_modules, layout_config_override,
+       created_at, updated_at)
+  VALUES (?, ?, ?, ?, 'TEMPLATE_SELECTING', NULL, ?, ?, ?::jsonb, ?::jsonb, NOW(), NOW());
+
+  -- 创建工作流阶段记录
+  INSERT INTO t_workflow_stage (id, project_id, stage_name, stage_order, status, created_at, updated_at) VALUES
+  (uuid_generate_v4(), ?, 'DOC_GENERATING',    1, 'PENDING', NOW(), NOW()),
+  (uuid_generate_v4(), ?, 'PROTOTYPE_GENERATING', 2, 'PENDING', NOW(), NOW()),
+  (uuid_generate_v4(), ?, 'UI_DESIGNING',      3, 'PENDING', NOW(), NOW()),
+  (uuid_generate_v4(), ?, 'TECH_PLAN_GENERATING',4, 'PENDING', NOW(), NOW()),
+  (uuid_generate_v4(), ?, 'CODE_GENERATING',   5, 'PENDING', NOW(), NOW());
+COMMIT;
+```
+
+#### 11.2.2 前端执行方案
+
+```
+projects/                       // 项目管理模块目录
+├── pages/
+│   ├── ProjectList.vue         // 项目列表页
+│   │   ├── el-table: 项目名/模板/状态/创建时间/操作
+│   │   ├── 筛选栏: 状态下拉 + 关键字搜索
+│   │   └── 创建项目按钮 → 跳转创建向导
+│   │
+│   ├── ProjectCreateWizard.vue // 创建项目-三步向导容器（主入口）
+│   │   ├── el-steps: [模板选择, 功能定制, 排版配置]
+│   │   └── el-main: 根据当前步骤显示对应子组件
+│   │
+│   └── ProjectDetail.vue       // 项目详情页
+│       ├── 顶部: 项目基本信息卡片
+│       ├── 中部: 工作流阶段时间线 / 各阶段交付物入口
+│       └── 底部: 操作按钮区（进入预览 / 重试 / 删除）
+│
+├── components/
+│   ├── Step1TemplateSelect.vue // 步骤1: 模板选择
+│   │   ├── el-card 网格（每个模板一张卡片）
+│   │   ├── 卡片悬停: 显示模板详情 + 适用场景
+│   │   └── 选中后: nextStep() → emit('next', templateId)
+│   │
+│   ├── Step2ModuleCustomize.vue // 步骤2: 功能模块定制
+│   │   ├── 必选模块: el-checkbox disabled + checked
+│   │   ├── 可选模块: el-checkbox 自由勾选
+│   │   └── 每个模块: 图标 + 名称 + 描述 + 标签
+│   │
+│   ├── Step3LayoutConfig.vue   // 步骤3: 排版布局配置
+│   │   ├── 排版方案 el-radio-group（可视化预览缩略图）
+│   │   ├── 可选: 自定义配置（primaryColor / fontSize / borderRadius）
+│   │   └── 底部: 创建按钮 → POST /api/v1/projects
+│   │
+│   ├── ProjectStatusBadge.vue  // 项目状态标签
+│   └── StageTimeline.vue       // 工作流阶段时间线
+│
+├── stores/
+│   └── projectStore.ts         // Pinia 项目状态
+│       ├── state: { projectList, currentProject, createWizard }
+│       ├── fetchProjects(params) → GET /api/v1/projects
+│       ├── fetchProjectDetail(id) → GET /api/v1/projects/{id}
+│       ├── createProject(data) → POST /api/v1/projects
+│       ├── updateProject(id, data) → PUT /api/v1/projects/{id}
+│       └── deleteProject(id) → DELETE /api/v1/projects/{id}
+│
+└── router/
+    └── projects.routes.ts
+        ├── /projects              → ProjectList.vue
+        ├── /projects/create       → ProjectCreateWizard.vue
+        └── /projects/:id          → ProjectDetail.vue
+```
+
+**创建项目三步向导数据流**：
+```
+Step1TemplateSelect.vue
+    │ mounted → GET /api/v1/templates
+    │           → 展示模板卡片列表
+    │ 用户选择 → emit('select', templateId)
+    │           → wizardContext.templateId = templateId
+    │
+    ▼
+Step2ModuleCustomize.vue
+    │ mounted → GET /api/v1/templates/{templateId}/modules
+    │           → 展示模块列表（必选/可选）
+    │ 用户勾选 → wizardContext.selectedModuleIds = [...]
+    │
+    ▼
+Step3LayoutConfig.vue
+    │ mounted → GET /api/v1/templates/{templateId}/layouts
+    │           → 展示排版方案列表
+    │ 用户选择 → wizardContext.layoutId = layoutId
+    │ 用户点击「创建」→ POST /api/v1/projects (wizardContext)
+    │           → 成功 → router.push(`/projects/${id}`)
+    │           → 失败 → 错误提示（如配额不足）
+```
+
+#### 11.2.3 后端执行方案
+
+```
+【创建项目完整流程】
+
+POST /api/v1/projects
+  │
+  ├── ProjectController.create(@Valid CreateProjectRequest, @AuthenticationPrincipal user)
+  │     └── @RequirePermission("project:create")
+  │
+  ├── ProjectServiceImpl.createProject(request, userId)
+  │     │
+  │     │  ┌─── CreateProjectRequest DTO ───┐
+  │     │  │ String name                    │
+  │     │  │ String description             │
+  │     │  │ String templateId              │
+  │     │  │ String layoutId                │
+  │     │  │ List<String> selectedModules   │
+  │     │  │ JSON layoutConfigOverride      │
+  │     │  └────────────────────────────────┘
+  │     │
+  │     ├── ① 配额校验
+  │     │     userRepository.checkQuota(userId)
+  │     │     └── monthlyQuota > usedQuota ? → 继续 : throw QuotaExceededException
+  │     │
+  │     ├── ② 模板校验
+  │     │     template = templateRepository.findById(templateId)
+  │     │     └── template.isActive() ? → 继续 : throw BadRequestException
+  │     │
+  │     ├── ③ 必选模块完整性校验
+  │     │     requiredModules = templateFunctionRepository
+  │     │         .findByTemplateIdAndIsRequired(templateId, true)
+  │     │     └── selectedModules.containsAll(requiredModules) ? → 继续
+  │     │         : throw BadRequestException("必选模块缺失")
+  │     │
+  │     ├── ④ 排版方案校验
+  │     │     templateLayoutRepository.existsByTemplateIdAndLayoutId(templateId, layoutId)
+  │     │     └── true ? → 继续 : throw BadRequestException("排版不适用于该模板")
+  │     │
+  │     ├── ⑤ @Transactional → 原子创建
+  │     │     ├── userRepository.incrementUsedQuota(userId)
+  │     │     ├── project = projectRepository.save(project)       // status=TEMPLATE_SELECTING
+  │     │     └── workflowStageRepository.saveAll(workflowStages) // 5个阶段 PENDING
+  │     │
+  │     ├── ⑥ 异步启动 AI 工作流
+  │     │     CompletableFuture.runAsync(() ->
+  │     │         workflowExecutor.execute(projectId, request))
+  │     │
+  │     └── ⑦ 返回 ProjectResponse (含 workFlowStages 列表)
+  │
+  └── 全局异常处理
+        ├── QuotaExceededException → 400 QUOTA_EXCEEDED
+        ├── BadRequestException → 400 具体原因
+        └── Exception → 500 内部错误
+
+【项目列表查询】
+
+GET /api/v1/projects?page=0&size=10&status=RUNNING&keyword=电商
+  │
+  ├── ProjectController.list(@PageableDefault Pageable, status, keyword, user)
+  │
+  └── ProjectServiceImpl.listProjects(userId, keyword, status, pageable)
+        ├── Specification<Project> spec = (root, query, cb) -> {
+        │     predicates = [cb.equal(root.get("userId"), userId)]
+        │     if (status != null) predicates.add(cb.equal(root.get("status"), status))
+        │     if (keyword != null)
+        │         predicates.add(cb.or(
+        │             cb.like(root.get("name"), "%"+keyword+"%"),
+        │             cb.like(root.get("description"), "%"+keyword+"%")
+        │         ))
+        │     return cb.and(predicates)
+        │   }
+        ├── Page<Project> page = projectRepository.findAll(spec, pageable)
+        └── 返回 PageResult<ProjectResponse>
+```
+
+---
+
+### 11.3 【M3】工作流预览与交付物模块
+
+> **依赖**：M1、M2、M6（AI 引擎 SSE 推送）
+> **涉及表**：`t_deliverable`、`t_deliverable_version`、`t_deliverable_feedback`、`t_deliverable_change_log`、`t_workflow_stage`、`t_workflow_subtask`、`t_workflow_preview_state`
+> **关键文件**：`pick-up-service`、`pick-up-api`、`pick-up-ai-engine`
+
+#### 11.3.1 SQL 设计
+
+**涉及表清单**：
+
+| 表名 | 职责 | DDL 位置 |
+|------|------|----------|
+| `t_deliverable` | 交付物主表 | §6.2.4 + §10.1.6 ALTER |
+| `t_deliverable_version` | 版本历史快照 | §10.1.1 |
+| `t_deliverable_feedback` | 用户修改意见 | §10.1.2 |
+| `t_deliverable_change_log` | 变更记录明细 | §10.1.4 |
+| `t_workflow_stage` | 工作流阶段 | §6.2.3 + §10.1.6 ALTER |
+| `t_workflow_subtask` | 工作流子任务 | §10.1.3 |
+| `t_workflow_preview_state` | 预览操作状态 | §10.1.5 |
+
+**核心查询 SQL**：
+
+```sql
+-- 1. 获取 PRD 交付物（含当前版本内容）
+SELECT d.*, dv.content_text, dv.content_json, dv.version AS current_version,
+       dv.change_summary, dv.created_at AS version_created_at
+FROM t_deliverable d
+LEFT JOIN t_deliverable_version dv ON d.id = dv.deliverable_id
+    AND dv.version = d.current_version
+WHERE d.project_id = ? AND d.deliverable_type = 'PRD';
+
+-- 2. 获取版本历史列表
+SELECT id, version, trigger_type, change_summary, content_hash, file_size, created_by, created_at
+FROM t_deliverable_version
+WHERE deliverable_id = ?
+ORDER BY created_at DESC;
+
+-- 3. 获取变更记录明细
+SELECT id, change_position, change_type, change_content, change_detail, sort_order
+FROM t_deliverable_change_log
+WHERE version_id = ?
+ORDER BY sort_order;
+
+-- 4. 获取预览状态
+SELECT ps.*, dv.version AS preview_version
+FROM t_workflow_preview_state ps
+LEFT JOIN t_deliverable_version dv ON ps.current_version = dv.version
+    AND dv.deliverable_id = (SELECT id FROM t_deliverable WHERE project_id = ? AND deliverable_type = ?)
+WHERE ps.project_id = ? AND ps.stage_name = ?;
+
+-- 5. 获取子任务列表
+SELECT id, task_name, task_order, status, output_files, error_message,
+       duration_ms, started_at, completed_at
+FROM t_workflow_subtask
+WHERE stage_id = ?
+ORDER BY task_order;
+
+-- 6. 提交修改意见（创建反馈记录）
+INSERT INTO t_deliverable_feedback (id, project_id, deliverable_id, deliverable_type,
+       feedback_type, target_section, feedback_content, before_snapshot, status, from_version, created_by)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?);
+
+-- 7. 确认阶段推进
+BEGIN;
+  -- 更新交付物确认状态
+  UPDATE t_deliverable SET confirmed = TRUE, confirmed_at = NOW(), confirmed_by = ? WHERE id = ?;
+  -- 更新预览状态
+  UPDATE t_workflow_preview_state SET preview_status = 'CONFIRMED',
+      confirmed_at = NOW(), confirmed_by = ?
+  WHERE project_id = ? AND stage_name = ?;
+  -- 推进工作流阶段
+  UPDATE t_workflow_stage SET status = 'COMPLETED', completed_at = NOW()
+  WHERE project_id = ? AND stage_name = ?;
+  UPDATE t_project SET current_stage = ?, updated_at = NOW() WHERE id = ?;
+COMMIT;
+
+-- 8. 回退到指定版本
+BEGIN;
+  SELECT content_text, content_json, file_path
+  FROM t_deliverable_version
+  WHERE deliverable_id = ? AND version = ?;
+  -- 使用查询结果更新 t_deliverable
+  UPDATE t_deliverable SET current_version = ?, version_count = version_count + 1
+  WHERE id = ?;
+  -- 创建回退版本快照
+  INSERT INTO t_deliverable_version (id, deliverable_id, project_id, version,
+       content_text, content_json, file_path, trigger_type, parent_version, created_by)
+  VALUES (?, ?, ?, ?, ?, ?, ?, 'ROLLBACK', ?, ?);
+  -- 更新预览状态
+  UPDATE t_workflow_preview_state SET preview_status = 'REVERTED',
+      revert_count = revert_count + 1, last_action = 'REVERT', last_action_at = NOW()
+  WHERE project_id = ? AND stage_name = ?;
+COMMIT;
+```
+
+**版本号生成函数 SQL**：
+```sql
+-- PostgreSQL 函数：生成下一个版本号 v{major}.{minor}
+CREATE OR REPLACE FUNCTION next_version(p_current_version VARCHAR)
+RETURNS VARCHAR AS $$
+DECLARE
+    v_major INT;
+    v_minor INT;
+BEGIN
+    v_major := (regexp_match(p_current_version, 'v(\d+)\.(\d+)'))[1]::INT;
+    v_minor := (regexp_match(p_current_version, 'v(\d+)\.(\d+)'))[2]::INT;
+    RETURN 'v' || v_major || '.' || (v_minor + 1);
+END;
+$$ LANGUAGE plpgsql;
+```
+
+#### 11.3.2 前端执行方案
+
+```
+deliverables/                   // 工作流预览模块目录
+├── pages/
+│   └── WorkflowPreview.vue     // 统一工作流预览页（核心）
+│       ├── URL: /projects/:id/workflow-preview
+│       ├── 左右分栏布局
+│       │   ├── 左栏（380px）: AI 对话输入面板
+│       │   └── 右栏（flex-1）: 交付物效果预览区
+│       └── 底部操作按钮栏 + 任务列表
+│
+├── components/
+│   ├── preview-left/
+│   │   └── AiChatPanel.vue                     // AI对话面板（左栏）
+│   │       ├── el-input textarea（修改意见输入）
+│   │       ├── el-button（提交修改）→ POST feedback
+│   │       ├── AI 状态指示器（GENERATING/PREVIEWING/UPDATING）
+│   │       └── 历史意见列表（el-timeline）
+│   │
+│   ├── preview-right/
+│   │   ├── PrdPreview.vue                       // PRD Markdown 预览
+│   │   │   ├── marked.js 渲染 MD → HTML
+│   │   │   ├── github-markdown-css 样式
+│   │   │   ├── 章节定位：左侧 TOC + 右侧内容
+│   │   │   └── 章节标注编辑模式（可选）
+│   │   │
+│   │   ├── PrototypePreview.vue                 // HTML 原型预览
+│   │   │   ├── iframe 内嵌原型 HTML
+│   │   │   ├── 设备模拟器（Desktop / Tablet / Mobile 切换）
+│   │   │   ├── 刷新按钮（reload iframe）
+│   │   │   └── el-tooltip 组件标注（可选拖拽编辑）
+│   │   │
+│   │   └── UiDesignPreview.vue                  // UI 设计稿预览
+│   │       ├── 设计稿 iframe / Canvas 渲染
+│   │       ├── 配色方案切换 el-select（主题色/深色模式）
+│   │       ├── el-color-picker（主题色实时切换）
+│   │       └── el-slider（圆角/间距/字体 实时调整）
+│   │
+│   ├── preview-bottom/
+│   │   ├── PreviewActionBar.vue                 // 操作按钮栏
+│   │   │   ├── el-button: 确认变更（primary）
+│   │   │   ├── el-button: 撤回（danger）
+│   │   │   ├── el-button: 跳过预览（default）
+│   │   │   └── el-popover: 版本历史下拉
+│   │   │
+│   │   └── ChangeLogTable.vue                   // 变更内容表格
+│   │       ├── el-table: [更新位置, 变更类型标签, 变更描述]
+│   │       ├── ADD=绿色 / MODIFY=蓝色 / DELETE=红色 标签
+│   │       └── 展开行: 变更详情（新旧对比 diff）
+│   │
+│   ├── subtask/
+│   │   └── SubtaskList.vue                      // 子任务列表
+│   │       ├── el-timeline: 任务执行状态
+│   │       ├── PENDING=灰 / RUNNING=蓝loading / COMPLETED=绿 / FAILED=红
+│   │       └── 展开: outputFiles 文件列表 + errorMessage
+│   │
+│   └── version/
+│       └── VersionHistory.vue                    // 版本历史弹窗
+│           ├── el-dialog: 版本列表
+│           ├── 每项: 版本号 + 触发类型 + 变更摘要 + 时间
+│           └── 回退按钮 → POST rollback
+│
+├── composables/
+│   └── useSseStream.ts           // SSE 流式连接 Hook
+│       ├── connect(projectId)    // new EventSource('/api/v1/workflow/{id}/stream')
+│       ├── onMessage(eventType, callback)  // 事件类型分发
+│       ├── onError(callback)     // 连接错误 + 自动重连
+│       └── disconnect()          // EventSource.close()
+│
+├── stores/
+│   └── previewStore.ts           // Pinia 预览状态
+│       ├── state: {
+│       │   previewStatus,     // GENERATING / PREVIEWING / UPDATING / CONFIRMED
+│       │   currentVersion,    // v1.0
+│       │   deliverableId,
+│       │   changeLogs[],      // 变更记录列表
+│       │   subtasks[],        // 子任务列表
+│       │   versions[],        // 版本历史
+│       │   isProcessing       // 是否正在AI处理中
+│       │ }
+│       ├── fetchPreviewState()     → GET /api/v1/workflow/{id}/preview-state
+│       ├── fetchDeliverable(type)  → GET /api/v1/deliverables/{id}/{type}
+│       ├── submitFeedback(data)    → POST .../feedback
+│       ├── confirmStage()          → POST .../confirm
+│       ├── rollbackTo(version)     → POST .../rollback
+│       └── setupSse()              → SSE 连接 + 事件处理
+│
+└── router/
+    └── deliverables.routes.ts
+        └── /projects/:id/workflow-preview → WorkflowPreview.vue
+
+**SSE 事件流处理**：
+```
+useSseStream.connect(projectId)
+  │
+  ├── event: stage:start     → 更新阶段状态为 RUNNING
+  ├── event: stage:progress  → 更新子任务进度条
+  ├── event: stage:complete  → 更新阶段状态为 COMPLETED
+  ├── event: preview:ready   → 展示「预览就绪」通知
+  │                             加载 changeLogs + subtasks
+  ├── event: update:start    → previewStatus = UPDATING
+  │                             显示 loading 遮罩
+  ├── event: update:complete → previewStatus = PREVIEWING
+  │                             刷新版本 + 变更记录
+  ├── event: phase:confirmed → 阶段已确认，自动跳转下一阶段
+  ├── event: stage:error     → ElMessage.error(errorMsg)
+  │                             显示重试按钮
+  └── event: workflow:complete → 工作流完成，跳转项目详情
+```
+
+#### 11.3.3 后端执行方案
+
+```
+【预览就绪通知流程】（AI 引擎 → 用户）
+
+AI Engine 完成生成后:
+  │
+  ├── DeliverableVersionService.createInitialVersion()
+  │     ├── INSERT t_deliverable_version (v1.0, content_text, content_json)
+  │     └── UPDATE t_deliverable SET current_version = 'v1.0', version_count = 1
+  │
+  ├── DeliverableChangeLogService.createChangeLogs()
+  │     └── BATCH INSERT t_deliverable_change_log (6条变更记录)
+  │
+  ├── WorkflowSubtaskService.createSubtasks()
+  │     └── BATCH INSERT t_workflow_subtask (6条子任务, status=COMPLETED)
+  │
+  ├── PreviewStateService.createPreviewState()
+  │     ├── INSERT t_workflow_preview_state (status=PREVIEWING)
+  │     └── UPDATE t_workflow_stage SET status = 'PREVIEWING'
+  │
+  └── SseEmitterManager.send(projectId, "preview:ready", {
+        deliverableId, currentVersion, changeLogUrl, subtaskUrl
+      })
+
+【用户提交修改意见流程】
+
+POST /api/v1/deliverables/{projectId}/prd/feedback
+  │
+  ├── DeliverableController.submitFeedback(projectId, FeedbackRequest)
+  │     └── @RequirePermission("project:edit")
+  │
+  ├── FeedbackServiceImpl.submitFeedback()
+  │     │
+  │     ├── ① 获取当前交付物内容快照
+  │     │     deliverableVersionRepository.findCurrent(deliverableId)
+  │     │
+  │     ├── ② 创建反馈记录
+  │     │     deliverableFeedbackRepository.save({
+  │     │       status=PENDING, fromVersion=currentVersion,
+  │     │       beforeSnapshot=currentContent, feedbackContent
+  │     │     })
+  │     │
+  │     ├── ③ 更新预览状态为 UPDATING
+  │     │     previewStateRepository.updateStatus(projectId, stage, "UPDATING")
+  │     │
+  │     ├── ④ SSE 推送: update:start
+  │     │     sseEmitterManager.send(projectId, "update:start", { feedbackId })
+  │     │
+  │     ├── ⑤ 异步调用 AI 引擎增量更新
+  │     │     CompletableFuture.runAsync(() ->
+  │     │         aiEngine.incrementalUpdate(projectId, deliverableId, feedback))
+  │     │
+  │     └── ⑥ 立即返回 { feedbackId, status: "PROCESSING" }
+
+  │  ┌── AI 引擎完成更新后回调 ──┐
+  │  │                           │
+  │  ├── ⑦ 创建新版本快照
+  │  │     deliverableVersionRepository.save( v1.1, newContent )
+  │  │
+  │  ├── ⑧ 计算 Diff → 生成变更记录
+  │  │     diff = TextDiffComparator.diff(beforeSnapshot, afterSnapshot)
+  │  │     deliverableChangeLogRepository.saveAll( diff.entries )
+  │  │
+  │  ├── ⑨ 更新反馈记录状态
+  │  │     deliverableFeedbackRepository.updateStatus( feedbackId, COMPLETED,
+  │  │         toVersion=v1.1, afterSnapshot=newContent )
+  │  │
+  │  ├── ⑩ 更新预览状态回 PREVIEWING
+  │  │     previewStateRepository.updateStatus( projectId, stage, "PREVIEWING", v1.1 )
+  │  │
+  │  └── ⑪ SSE 推送: update:complete
+  │        sseEmitterManager.send( projectId, "update:complete", {
+  │          newVersion, changeLogs, subtaskUpdates
+  │        })
+  └────────────────────────────────┘
+
+【用户确认推进流程】
+
+POST /api/v1/deliverables/{projectId}/prd/confirm
+  │
+  ├── PreviewServiceImpl.confirmStage(projectId, stage, userId)
+  │     │
+  │     ├── ① 防重复确认校验
+  │     │     previewStateRepository.find(projectId, stage)
+  │     │     └── status == CONFIRMED → throw StageAlreadyConfirmedException
+  │     │
+  │     ├── ② @Transactional 确认推进
+  │     │     ├── UPDATE t_deliverable SET confirmed=TRUE, confirmed_by=userId
+  │     │     ├── UPDATE t_workflow_preview_state SET
+  │     │     │     preview_status='CONFIRMED', confirmed_by=userId
+  │     │     ├── UPDATE t_workflow_stage SET status='COMPLETED'
+  │     │     └── UPDATE t_project SET current_stage=nextStage, status=RUNNING
+  │     │
+  │     ├── ③ SSE 推送: phase:confirmed
+  │     │     sseEmitterManager.send(projectId, "phase:confirmed",
+  │     │         { confirmedStage, nextStage })
+  │     │
+  │     └── ④ 触发下一阶段 AI 工作流
+  │           CompletableFuture.runAsync(() ->
+  │               workflowExecutor.executeNextStage(projectId, nextStage))
+```
+
+---
+
+### 11.4 【M4】模板管理模块
+
+> **依赖**：M1（认证鉴权）、M5（系统管理-菜单）
+> **涉及表**：`t_project_template`、`t_function_module`、`t_layout_rule`、`t_template_function`、`t_template_layout`、`t_feature`、`t_feature_template`
+> **关键文件**：`pick-up-service`、`pick-up-api`
+
+#### 11.4.1 SQL 设计
+
+**涉及表清单**：
+
+| 表名 | 职责 | DDL 位置 |
+|------|------|----------|
+| `t_project_template` | 项目模板 | §6.2.15 |
+| `t_function_module` | 功能模块库 | §6.2.13 |
+| `t_layout_rule` | 排版规则库 | §6.2.14 |
+| `t_template_function` | 模板-模块 N:N | §6.2.16 |
+| `t_template_layout` | 模板-排版 N:N | §6.2.17 |
+| `t_feature` | 功能管理树 | §6.2.18 |
+| `t_feature_template` | 功能-模板关联 | §6.2.19 |
+
+**核心查询 SQL**：
+
+```sql
+-- 1. 模板详情（含关联模块 + 排版）
+SELECT t.*,
+       (SELECT json_agg(json_build_object(
+            'moduleId', fm.id, 'moduleName', fm.module_name, 'moduleKey', fm.module_key,
+            'domain', fm.domain, 'isRequired', tf.is_required
+        )) FROM t_template_function tf JOIN t_function_module fm ON tf.module_id = fm.id
+        WHERE tf.template_id = t.id) AS modules,
+       (SELECT json_agg(json_build_object(
+            'layoutId', lr.id, 'layoutName', lr.layout_name, 'layoutType', lr.layout_type,
+            'isDefault', tl.is_default
+        )) FROM t_template_layout tl JOIN t_layout_rule lr ON tl.layout_id = lr.id
+        WHERE tl.template_id = t.id) AS layouts
+FROM t_project_template t
+WHERE t.id = ?;
+
+-- 2. 功能模块树查询（递归 CTE）
+WITH RECURSIVE feature_tree AS (
+    SELECT id, parent_id, feature_name, feature_key, description, icon,
+           0 AS depth, feature_name AS path
+    FROM t_feature WHERE parent_id IS NULL AND status = 'ACTIVE'
+    UNION ALL
+    SELECT f.id, f.parent_id, f.feature_name, f.feature_key, f.description, f.icon,
+           ft.depth + 1, ft.path || ' > ' || f.feature_name
+    FROM t_feature f
+    JOIN feature_tree ft ON f.parent_id = ft.id
+    WHERE f.status = 'ACTIVE'
+)
+SELECT * FROM feature_tree ORDER BY path;
+
+-- 3. 模板复制（克隆模板及关联）
+WITH new_template AS (
+    INSERT INTO t_project_template (id, template_name, template_code, category,
+        description, project_type, tech_stack, is_active, is_system, usage_count, sort_order)
+    VALUES (?, ?, ?, ?, ?, ?, ?::jsonb, TRUE, FALSE, 0, ?)
+    RETURNING id
+)
+SELECT id FROM new_template;
+-- 然后复制关联:
+INSERT INTO t_template_function (id, template_id, module_id, is_required, sort_order)
+SELECT uuid_generate_v4(), ?, module_id, is_required, sort_order
+FROM t_template_function WHERE template_id = ?;
+
+INSERT INTO t_template_layout (id, template_id, layout_id, is_default)
+SELECT uuid_generate_v4(), ?, layout_id, is_default
+FROM t_template_layout WHERE template_id = ?;
+
+-- 4. 更新模板-模块关联（全量替换）
+BEGIN;
+    DELETE FROM t_template_function WHERE template_id = ?;
+    INSERT INTO t_template_function (id, template_id, module_id, is_required, sort_order)
+    VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), ...;
+COMMIT;
+
+-- 5. 功能模块搜索（用户端）
+SELECT * FROM t_function_module
+WHERE is_active = TRUE
+  AND (:domain IS NULL OR domain = :domain)
+  AND (:keyword IS NULL OR module_name ILIKE '%' || :keyword || '%'
+       OR description ILIKE '%' || :keyword || '%')
+ORDER BY is_core DESC, sort_order;
+```
+
+#### 11.4.2 前端执行方案
+
+```
+system/                         // 系统管理模块目录
+├── pages/
+│   ├── templates/
+│   │   ├── TemplateList.vue            // 模板列表页
+│   │   │   ├── el-card 网格: 每个模板一张卡片
+│   │   │   ├── 卡片内容: 名称/分类标签/使用次数/状态开关
+│   │   │   ├── 筛选: 分类 el-select + 关键字搜索
+│   │   │   └── 新建按钮 → TemplateForm.vue
+│   │   │
+│   │   └── TemplateForm.vue            // 模板编辑/新建页
+│   │       ├── 基本信息表单: 名称/编码/分类/项目类型/描述
+│   │       ├── 技术栈配置: JSON 编辑 / 可视化选择
+│   │       ├── 关联功能模块 Tab:
+│   │       │   ├── el-transfer 穿梭框（左右选择）
+│   │       │   ├── 左侧: 所有可用模块
+│   │       │   └── 右侧: 已选模块（可标记必选/可选）
+│   │       └── 关联排版方案 Tab:
+│   │           ├── el-checkbox-group: 排版方案勾选
+│   │           └── 默认排版 el-radio
+│   │
+│   ├── modules/
+│   │   ├── ModuleList.vue              // 功能模块库页
+│   │   │   ├── el-table: 名称/标识/领域/核心标签/状态
+│   │   │   ├── 筛选: 领域 el-select + 核心/非核心切换
+│   │   │   ├── 新建/编辑 Dialog
+│   │   │   └── 批量操作: 批量启停/批量导出
+│   │   │
+│   │   └── ModuleForm.vue             // 功能模块表单 Dialog
+│   │       ├── 名称/标识/领域 选择
+│   │       ├── 描述 el-input type=textarea
+│   │       ├── 标签 el-tag 输入
+│   │       └── 是否核心 / 排序号
+│   │
+│   ├── layouts/
+│   │   ├── LayoutList.vue              // 排版规则库页
+│   │   │   ├── el-table: 名称/类型/适用场景/状态
+│   │   │   └── 新建/编辑 Dialog
+│   │   │
+│   │   └── LayoutForm.vue             // 排版规则表单
+│   │       ├── 名称/类型 选择
+│   │       ├── 配置 JSON 编辑器 (codemirror / monaco)
+│   │       ├── 实时预览: 右栏显示当前配置的效果示意
+│   │       └── 适用场景: 多选标签
+│   │
+│   └── features/
+│       ├── FeatureList.vue             // 功能管理页
+│       │   ├── el-tree: 功能树（可展开/折叠）
+│       │   ├── 树节点操作: [新增子节点/编辑/禁用/删除]
+│       │   ├── 批量操作: 批量启停/批量移动
+│       │   └── 关联模板 Dialog: 可查看/编辑功能关联的模板
+│       │
+│       └── FeatureForm.vue            // 功能节点表单
+│           ├── 上级功能 el-tree-select
+│           ├── 名称/标识/描述/图标
+│           └── 启用状态开关
+│
+├── stores/
+│   ├── templateStore.ts
+│   │   ├── fetchTemplates(params)
+│   │   ├── fetchTemplate(id)
+│   │   ├── createTemplate(data)
+│   │   ├── updateTemplate(id, data)
+│   │   ├── deleteTemplate(id)
+│   │   ├── assignModules(templateId, moduleIds)
+│   │   └── assignLayouts(templateId, layoutIds)
+│   │
+│   ├── moduleStore.ts
+│   │   ├── fetchModules(params)
+│   │   ├── createModule(data) / updateModule(id, data)
+│   │   ├── batchToggle(ids, active) / batchDelete(ids)
+│   │   └── exportModules() / importModules(file)
+│   │
+│   ├── layoutStore.ts
+│   │   └── fetchLayouts / fetchLayout / createLayout / updateLayout
+│   │
+│   └── featureStore.ts
+│       ├── fetchFeatureTree()           → GET /admin/features/tree
+│       ├── createFeature(data)
+│       ├── updateFeature(id, data)
+│       ├── batchToggle(ids, status)
+│       └── batchMove(ids, newParentId)
+│
+└── router/
+    └── system.routes.ts (模板管理部分)
+        ├── /system/templates    → TemplateList.vue
+        ├── /system/templates/:id→ TemplateForm.vue
+        ├── /system/modules      → ModuleList.vue
+        ├── /system/layouts      → LayoutList.vue
+        └── /system/features     → FeatureList.vue
+```
+
+#### 11.4.3 后端执行方案
+
+```
+【模板创建完整流程】
+
+POST /api/v1/admin/templates
+  │
+  ├── TemplateController.create(@Valid TemplateRequest)
+  │     └── @RequirePermission("template:write")
+  │
+  └── TemplateServiceImpl.createTemplate(request)
+        │
+        ├── ① 校验 templateCode 唯一性
+        │     templateRepository.existsByCode(request.templateCode)
+        │     └── true → throw ConflictException("编码重复")
+        │
+        ├── ② 校验关联模块存在
+        │     moduleIds = request.moduleIds
+        │     existingCount = functionModuleRepository.countByIdIn(moduleIds)
+        │     └── existingCount != moduleIds.size → throw NotFoundException
+        │
+        ├── ③ @Transactional 创建
+        │     ├── template = projectTemplateRepository.save(template)
+        │     ├── templateFunctionRepository.saveAll(
+        │     │     moduleIds.map(m -> TemplateFunction(templateId, moduleId, isRequired))
+        │     │ )
+        │     └── templateLayoutRepository.saveAll(
+        │     │     layoutIds.map(l -> TemplateLayout(templateId, layoutId, isDefault))
+        │     │ )
+        │
+        ├── ④ 清除 Redis 缓存
+        │     redisTemplate.delete("template:list:all")
+        │     redisTemplate.delete("template:detail:" + templateId)
+        │
+        └── ⑤ 返回 TemplateResponse
+
+【更新时间需处理关联变更】
+  │
+  ├── 对比新旧 moduleIds / layoutIds
+  ├── DELETE 旧关联 + INSERT 新关联
+  └── 同一事务内完成
+
+【功能模块管理】
+
+功能模块 CRUD:
+  ├── ModuleController.list()  → ModuleServiceImpl.listModules(domain, keyword)
+  │     └── JpaSpecificationExecutor 动态查询 + 分页
+  │
+  ├── ModuleController.create() → 校验 moduleKey 唯一 → INSERT
+  │
+  ├── ModuleController.batchToggle() → UPDATE ... SET is_active = ? WHERE id IN (?)
+  │
+  └── ModuleController.batchExport() → 查询 → 生成 Excel (Apache POI)
+
+【功能管理树(FEATURE)】
+
+功能管理:
+  ├── FeatureServiceImpl.getTree()
+  │     ├── featureRepository.findAll( Sort.by("sortOrder") )
+  │     └── 内存构建树: Map<parentId, List<Feature>> 递归
+  │
+  ├── FeatureServiceImpl.create(data)
+  │     ├── parentId != null → 校验父节点存在
+  │     └── featureRepository.save(feature)
+  │
+  └── FeatureServiceImpl.batchMove(ids, newParentId)
+        ├── 校验 newParentId 存在
+        ├── 校验不形成循环引用（自引用/间接引用）
+        └── UPDATE ... SET parent_id = ? WHERE id IN (?)
+```
+
+---
+
+### 11.5 【M5】系统管理模块
+
+> **依赖**：M1（认证鉴权）
+> **涉及表**：`t_user`、`t_role`、`t_menu`、`t_user_role`、`t_role_menu`、`t_role_api`
+> **关键文件**：`pick-up-service`、`pick-up-api`
+
+#### 11.5.1 SQL 设计
+
+**涉及表清单**：
+
+| 表名 | 职责 | DDL 位置 |
+|------|------|----------|
+| `t_user` | 用户表 | §6.2.1 |
+| `t_role` | 角色表 | §6.2.6 |
+| `t_menu` | 菜单表 | §6.2.5 |
+| `t_user_role` | 用户-角色关联 | §6.2.9 |
+| `t_role_menu` | 角色-菜单关联 | §6.2.7 |
+| `t_role_api` | 角色-接口权限 | §6.2.8 |
+
+**核心查询 SQL**：
+
+```sql
+-- 1. 用户列表查询（含角色）
+SELECT u.*,
+       (SELECT json_agg(json_build_object('id', r.id, 'name', r.name, 'code', r.code))
+        FROM t_user_role ur JOIN t_role r ON ur.role_id = r.id WHERE ur.user_id = u.id
+       ) AS roles
+FROM t_user u
+WHERE (:keyword IS NULL OR u.username ILIKE '%' || :keyword || '%'
+       OR u.email ILIKE '%' || :keyword || '%' OR u.nickname ILIKE '%' || :keyword || '%')
+  AND (:status IS NULL OR u.status = :status)
+ORDER BY u.created_at DESC
+LIMIT ? OFFSET ?;
+
+-- 2. 菜单树查询
+SELECT id, parent_id, name, type, path, component, icon, permission, sort_order, visible
+FROM t_menu
+WHERE status = 'ACTIVE'
+ORDER BY parent_id NULLS FIRST, sort_order;
+
+-- 3. 角色详情（含完整权限）
+SELECT r.*,
+       (SELECT json_agg(m.id) FROM t_role_menu rm JOIN t_menu m ON rm.menu_id = m.id
+        WHERE rm.role_id = r.id) AS menu_ids,
+       (SELECT json_agg(json_build_object(
+            'id', ra.id, 'method', ra.method, 'pathPattern', ra.path_pattern, 'description', ra.description
+        )) FROM t_role_api ra WHERE ra.role_id = r.id) AS apis
+FROM t_role r WHERE r.id = ?;
+
+-- 4. 角色权限分配（全量替换）
+BEGIN;
+    -- 分配菜单权限
+    DELETE FROM t_role_menu WHERE role_id = ?;
+    INSERT INTO t_role_menu (id, role_id, menu_id, created_at)
+    SELECT uuid_generate_v4(), ?, unnest(ARRAY[:menuIds]::text[]), NOW();
+
+    -- 分配接口权限
+    DELETE FROM t_role_api WHERE role_id = ?;
+    INSERT INTO t_role_api (id, role_id, method, path_pattern, description, created_at)
+    VALUES (?, ?, ?, ?, ?, NOW()), ...;
+COMMIT;
+
+-- 5. 用户角色分配
+BEGIN;
+    DELETE FROM t_user_role WHERE user_id = ?;
+    INSERT INTO t_user_role (id, user_id, role_id, created_at)
+    SELECT uuid_generate_v4(), ?, unnest(ARRAY[:roleIds]::text[]), NOW();
+COMMIT;
+
+-- 6. 菜单排序调整
+UPDATE t_menu SET sort_order = ? WHERE id = ?;    -- 单条
+-- 或批量:
+UPDATE t_menu SET sort_order = CASE id
+    WHEN ? THEN ? WHEN ? THEN ? WHEN ? THEN ? ... END
+WHERE id IN (?, ?, ?, ...);
+```
+
+#### 11.5.2 前端执行方案
+
+```
+system/
+├── pages/
+│   ├── users/
+│   │   └── UserList.vue                    // 用户管理页
+│   │       ├── el-table: 用户名/邮箱/昵称/角色标签/状态/配额/创建时间
+│   │       ├── 筛选: 状态选择 + 关键字搜索
+│   │       ├── 新建用户 Dialog
+│   │       └── 行操作: [编辑/角色分配/重置密码/启用禁用]
+│   │
+│   ├── roles/
+│   │   ├── RoleList.vue                    // 角色列表页
+│   │   │   ├── el-table: 角色名/编码/描述/系统角色标识/状态
+│   │   │   ├── 行操作: [权限分配/编辑/禁用]
+│   │   │   └── 新建按钮 → RoleForm.vue
+│   │   │
+│   │   └── RolePermission.vue             // 角色权限分配页（核心）
+│   │       ├── 左：角色选择列表 el-select
+│   │       ├── 中：菜单权限 el-tree（check-strictly）
+│   │       │   ├── 节点格式: [图标] 菜单名称 (权限标识)
+│   │       │   ├── 全选/取消全选
+│   │       │   └── 展开/折叠全部
+│   │       └── 右：接口权限 el-table + 新增API Dialog
+│   │           ├── 列: 请求方法标签/路径/描述/操作
+│   │           └── 新增: METHOD下拉 + 路径输入 + 描述
+│   │
+│   ├── menus/
+│   │   └── MenuList.vue                     // 菜单管理页
+│   │       ├── el-table（tree模式）: 展开/折叠
+│   │       ├── 列: 名称/图标/路径/组件/权限标识/类型标签/可见/排序
+│   │       ├── 行操作: [新增子级/编辑/删除/上移/下移]
+│   │       ├── 新建根菜单按钮
+│   │       └── MenuForm.vue Dialog:
+│   │           ├── 父级菜单 el-tree-select
+│   │           ├── 类型 el-radio: 目录/MENU/按钮(BTN)
+│   │           ├── 条件显示: 菜单→显示 path/component/icon
+│   │           ├── 按钮→显示 permission
+│   │           └── sortOrder/visible/keepAlive 开关
+│   │
+│   └── config/
+│       └── ConfigForm.vue                   // 系统配置页
+│           ├── 项目默认配置
+│           ├── AI 模型配置
+│           └── 配额默认值
+│
+├── stores/
+│   ├── userStore.ts
+│   │   ├── fetchUsers(params) / fetchUser(id)
+│   │   ├── createUser(data) / updateUser(id, data)
+│   │   ├── assignRoles(userId, roleIds)
+│   │   └── resetPassword(userId) / toggleStatus(userId)
+│   │
+│   ├── roleStore.ts
+│   │   ├── fetchRoles() / fetchRole(id)
+│   │   ├── createRole / updateRole / deleteRole(id)
+│   │   ├── fetchRoleMenus(roleId)  → role_menu 关联
+│   │   ├── fetchRoleApis(roleId)   → role_api 关联
+│   │   ├── assignMenus(roleId, menuIds)  → PUT /admin/roles/{id}/menus
+│   │   └── assignApis(roleId, apis)      → PUT /admin/roles/{id}/apis
+│   │
+│   └── menuStore.ts
+│       ├── fetchMenuTree()
+│       ├── createMenu(data) / updateMenu(id, data)
+│       ├── deleteMenu(id)       → 校验无子节点
+│       └── updateSortOrder(id, newOrder)
+│
+└── router/
+    └── system.routes.ts (系统管理部分)
+        ├── /system/users     → UserList.vue
+        ├── /system/roles     → RoleList.vue
+        ├── /system/roles/:id/permission → RolePermission.vue
+        ├── /system/menus     → MenuList.vue
+        └── /system/config    → ConfigForm.vue
+
+**菜单管理-类型联动**：
+```
+MenuForm.vue
+  │
+  ├── 当 type == 'DIR' (目录):
+  │     └── 显示: 名称 / 图标 / 排序 / 可见 / 上级
+  │     └── 隐藏: path / component / permission
+  │
+  ├── 当 type == 'MENU' (菜单):
+  │     └── 显示: 名称 / 图标 / 路径 / 组件 / 排序 / 可见 / 上级
+  │     └── 可选: permission (权限标识)
+  │
+  └── 当 type == 'BTN' (按钮):
+        └── 显示: 名称 / 权限标识 / 排序 / 上级
+        └── 隐藏: 图标 / 路径 / 组件 / 可见
+        └── 仅可选择 type='MENU' 或 type='DIR' 的上级
+```
+
+#### 11.5.3 后端执行方案
+
+```
+【角色权限分配核心流程】
+
+PUT /api/v1/admin/roles/{roleId}/menus
+  Body: { menuIds: ["m1","m2",...] }
+  │
+  ├── RoleController.assignMenus(roleId, request)
+  │     └── @RequirePermission("role:assign")
+  │
+  └── RoleServiceImpl.assignMenus(roleId, menuIds)
+        │
+        ├── ① 校验角色存在
+        │     roleRepository.findById(roleId)
+        │     └── 不存在 → throw NotFoundException
+        │
+        ├── ② 校验菜单 ID 有效性
+        │     validCount = menuRepository.countByIdIn(menuIds)
+        │     └── validCount != menuIds.size → throw BadRequestException
+        │
+        ├── ③ @Transactional 全量替换
+        │     ├── DELETE FROM t_role_menu WHERE role_id = roleId
+        │     └── BATCH INSERT INTO t_role_menu (roleId, menuId[])
+        │
+        ├── ④ 清除权限缓存
+        │     ├── redisTemplate.delete("menu:tree:" + roleId)
+        │     ├── 获取拥有该角色的所有用户
+        │     └── redisTemplate.delete("menu:tree:{userId}")  // 逐个清除
+        │
+        └── ⑤ 记录操作日志（审计）
+              auditLogRepository.save( AuditLog(
+                operator=userId, action="ASSIGN_ROLE_MENUS",
+                target=roleId, detail=menuIds
+              ))
+
+【菜单管理树构建】
+
+MenuServiceImpl.getMenuTree()
+  │
+  ├── ① 尝试从 Redis 读取
+  │     cached = redisTemplate.opsForValue().get("menu:tree:all")
+  │     └── 命中 → 直接返回
+  │
+  ├── ② 查询数据库
+  │     menus = menuRepository.findAllByStatusOrderBySortOrder("ACTIVE")
+  │
+  ├── ③ 内存构建树
+  │     Map<parentId, List<Menu>> grouped = menus.stream()
+  │         .collect(groupingBy(m -> m.getParentId() ?? ""))
+  │     rootNodes = grouped.get("")
+  │     forEach rootNode → attachChildren(node, grouped)  // 递归
+  │
+  ├── ④ 写入 Redis (TTL=1h)
+  │     redisTemplate.opsForValue().set("menu:tree:all", treeJson, 1, HOURS)
+  │
+  └── ⑤ 返回 MenuTreeNode[]
+
+【菜单删除前置校验】
+
+DELETE /api/v1/admin/menus/{id}
+  │
+  ├── MenuServiceImpl.deleteMenu(menuId)
+  │     ├── ① 校验是否存在子节点
+  │     │     childrenCount = menuRepository.countByParentId(menuId)
+  │     │     └── childrenCount > 0 → throw BusinessException("请先删除子菜单")
+  │     │
+  │     ├── ② 校验是否被角色引用
+  │     │     roleRefCount = roleMenuRepository.countByMenuId(menuId)
+  │     │     └── roleRefCount > 0 → throw BusinessException("菜单被角色引用，请先解除")
+  │     │
+  │     ├── ③ 执行删除
+  │     │     menuRepository.deleteById(menuId)
+  │     │
+  │     └── ④ 清除缓存
+  │           redisTemplate.delete("menu:tree:all")
+```
+
+---
+
+### 11.6 【M6】AI 工作流引擎模块
+
+> **依赖**：M1、M2、M3
+> **涉及表**：`t_workflow_stage`、`t_workflow_subtask`、`t_deliverable_version`、`t_prompt_template`、`t_model_config`、`t_deliverable`
+> **关键文件**：`pick-up-ai-engine`
+
+#### 11.6.1 SQL 设计
+
+**涉及表清单**：
+
+| 表名 | 职责 | DDL 位置 |
+|------|------|----------|
+| `t_workflow_stage` | 工作流阶段 | §6.2.3 + §10.1.6 ALTER |
+| `t_workflow_subtask` | 子任务记录 | §10.1.3 |
+| `t_deliverable_version` | 版本快照 | §10.1.1 |
+| `t_prompt_template` | AI 提示词模板 | §6.2.12 |
+| `t_model_config` | LLM 模型配置 | §6.2.11 |
+| `t_deliverable` | 交付物 | §6.2.4 + §10.1.6 ALTER |
+
+**核心查询 SQL**：
+
+```sql
+-- 1. 获取工作流阶段当前状态
+SELECT stage_name, status, started_at, completed_at,
+       total_subtasks, completed_subtasks, output_data, error_message
+FROM t_workflow_stage
+WHERE project_id = ?
+ORDER BY stage_order;
+
+-- 2. 获取活跃的 LLM 模型配置
+SELECT model_name, provider, api_base_url, default_temperature, max_tokens
+FROM t_model_config
+WHERE is_active = TRUE
+ORDER BY priority DESC;
+
+-- 3. 获取提示词模板
+SELECT system_prompt, user_prompt, variables
+FROM t_prompt_template
+WHERE template_key = ? AND is_default = TRUE;
+
+-- 4. 创建工作流子任务（批量）
+INSERT INTO t_workflow_subtask (id, project_id, stage_id, stage_name,
+       task_name, task_order, status, created_at) VALUES
+(?, ?, ?, ?, '解析用户需求文本', 1, 'PENDING', NOW()),
+(?, ?, ?, ?, '匹配项目模板',     2, 'PENDING', NOW()),
+(?, ?, ?, ?, '提取功能模块清单',  3, 'PENDING', NOW()),
+...;
+
+-- 5. 更新子任务状态
+UPDATE t_workflow_subtask
+SET status = ?, started_at = NOW()
+WHERE id = ? AND status = 'PENDING';
+
+UPDATE t_workflow_subtask
+SET status = 'COMPLETED', completed_at = NOW(), duration_ms = ?,
+    output_files = ?::jsonb
+WHERE id = ?;
+
+-- 6. 更新阶段子任务计数
+UPDATE t_workflow_stage
+SET completed_subtasks = (SELECT COUNT(*) FROM t_workflow_subtask
+    WHERE stage_id = ? AND status = 'COMPLETED')
+WHERE id = ?;
+
+-- 7. 保存工作流状态到 Redis（用于断点恢复）
+-- Redis Key: workflow:state:{projectId}
+-- Value: JSON { stage: "DOC_GENERATING", nodeIndex: 2, completedNodes: [...], nextRetryCount: 0 }
+SET workflow:state:{projectId} '{...}' EX 86400;
+```
+
+#### 11.6.2 前端执行方案
+
+```
+前端无专属页面，通过以下方式集成到 M3 的 WorkflowPreview.vue：
+
+├── useSseStream.ts (已在 M3 中定义)
+│   └── 监听 AI 引擎事件流
+│
+└── SSE 事件类型：
+    ├── stage:start     → ElNotification.info("开始生成 PRD...")
+    ├── stage:progress  → 进度条更新
+    │   { stageName, percent, currentTask, taskIndex, totalTasks }
+    ├── stage:complete  → ElNotification.success("PRD 生成完毕")
+    │   跳转 WorkflowPreview 预览界面
+    ├── preview:ready   → 加载交付物预览数据
+    ├── stage:error     → ElNotification.error(errorMsg + "可重试")
+    └── workflow:complete → 最终的交付物列表 + 项目完成通知
+```
+
+**AI 工作流阶段对应的前端状态流转**：
+```
+项目创建成功 → ProjectDetail 页
+  │
+  ├── 阶段1 DOC_GENERATING
+  │     ├── SSE: stage:start   → 显示 "PRD 生成中..."
+  │     ├── SSE: stage:complete→ 显示 "PRD 已生成，点击预览"
+  │     └── 用户点击「预览」  → 跳转 WorkflowPreview
+  │           ├── 预览/修改/确认 → 确认后自动触发阶段2
+  │
+  ├── 阶段2 PROTOTYPE_GENERATING  (同上流程)
+  │
+  ├── 阶段3 UI_DESIGNING          (同上流程)
+  │
+  ├── 阶段4 TECH_PLAN_GENERATING  (自动执行，无预览确认)
+  │
+  ├── 阶段5 CODE_GENERATING       (自动执行，完成后展示代码文件列表)
+  │
+  └── 完成 → ProjectDetail 页显示所有交付物入口
+```
+
+#### 11.6.3 后端执行方案
+
+```
+【工作流执行器核心架构】
+
+WorkflowExecutor.java
+  │
+  ├── @Service
+  ├── 字段注入:
+  │     modelConfigRepository, promptTemplateRepository,
+  │     workflowStageRepository, workflowSubtaskRepository,
+  │     deliverableRepository, deliverableVersionRepository,
+  │     SseEmitterManager, Langgraph4jStateGraph
+  │
+  ├── execute(projectId, CreateProjectRequest) ─ 入口方法
+  │     │
+  │     ├── ① 加载/构建 StateGraph (DAG)
+  │     │     StateGraph graph = buildOrchestrationGraph(request);
+  │     │     // 根据模板配置决定哪些节点需要执行
+  │     │     // 根据 selectedModules 决定跳过哪些阶段
+  │     │
+  │     ├── ② 创建 WorkflowState (持久化到 Redis)
+  │     │     WorkflowState state = WorkflowState.builder()
+  │     │         .projectId(projectId)
+  │     │         .currentStage("DOC_GENERATING")
+  │     │         .stageIndex(0)
+  │     │         .build();
+  │     │     redisRepository.save("workflow:state:" + projectId, state);
+  │     │
+  │     ├── ③ 遍历阶段执行
+  │     │     for (String stage : stages) {
+  │     │         executeStage(projectId, stage, state);
+  │     │     }
+  │     │
+  │     └── ④ 工作流完成
+  │           projectRepository.updateStatus(projectId, "COMPLETED");
+  │           sseEmitterManager.send(projectId, "workflow:complete", result);
+  │
+  ├── executeStage(projectId, stage, state)
+  │     │
+  │     ├── ① 更新阶段状态
+  │     │     workflowStageRepository.updateStatus(stageId, "RUNNING");
+  │     │     sseEmitterManager.send(projectId, "stage:start", { stage });
+  │     │
+  │     ├── ② 获取对应 Agent
+  │     │     Agent agent = agentFactory.getAgent(stage);
+  │     │     // 映射: DOC_GENERATING → DocGeneratorAgent
+  │     │     //        PROTOTYPE_GENERATING → PrototypeGeneratorAgent
+  │     │     //        ...
+  │     │
+  │     ├── ③ 加载 Prompt 模板
+  │     │     promptTemplate = promptTemplateRepository.findByKey(
+  │     │         getPromptKeyForStage(stage));
+  │     │     // 变量替换: {{requirement}} → project.requirementText
+  │     │     //           {{modules_json}} → JSON.stringify(modules)
+  │     │
+  │     ├── ④ 调用 LLM
+  │     │     modelConfig = modelConfigRepository.findActiveWithHighestPriority();
+  │     │     llmResponse = llmClient.chat(
+  │     │         model=modelConfig.getModelName(),
+  │     │         system=promptTemplate.getSystemPrompt(),
+  │     │         user=buildUserPrompt(promptTemplate, projectContext),
+  │     │         temperature=modelConfig.getDefaultTemperature(),
+  │     │         maxTokens=modelConfig.getMaxTokens()
+  │     │     );
+  │     │
+  │     ├── ⑤ 处理 Agent 输出
+  │     │     agentOutput = agent.processResponse(llmResponse);
+  │     │     // DocGeneratorAgent → Markdown 文档
+  │     │     // PrototypeGeneratorAgent → HTML 原型
+  │     │
+  │     ├── ⑥ 创建/更新交付物
+  │     │     deliverableVersionService.createVersion(
+  │     │         deliverableId, "v1.0", agentOutput.getContent());
+  │     │
+  │     ├── ⑦ 创建子任务记录
+  │     │     workflowSubtaskService.createSubtasks(
+  │     │         stageId, agentOutput.getSubtasks());
+  │     │
+  │     ├── ⑧ 更新阶段 + SSE 推送
+  │     │     workflowStageRepository.updateStatus(stageId, "COMPLETED");
+  │     │     sseEmitterManager.send(projectId, "stage:complete", {
+  │     │         stage, deliverableId, version: "v1.0"
+  │     │     });
+  │     │
+  │     └── ⑨ 需要用户确认的阶段 → 发送 preview:ready
+  │           if (CONFIRMABLE_STAGES.contains(stage)) {
+  │               previewStateService.createPreviewState(projectId, stage, "v1.0");
+  │               sseEmitterManager.send(projectId, "preview:ready", data);
+  │               waitForUserConfirmation(projectId, stage);  // 阻塞等待
+  │           }
+  │
+  └── 异常处理
+        ├── 可重试异常 (LLM RateLimit, NetworkTimeout)
+        │     retryCount <= 3 → state.incrementRetry() → 重新 executeStage()
+        │     retryCount > 3  → markStageFailed() + SSE push stage:error
+        │
+        └── 不可恢复异常 (ValidationError, QuotaExceeded)
+              markStageFailed() + SSE push stage:error + 停止工作流
+
+【Agent 工厂注册】
+
+AgentFactory.java
+  │
+  ├── Map<String, WorkflowAgent> agentRegistry = new HashMap<>();
+  │
+  ├── registerAgent("DOC_GENERATING", new DocGeneratorAgent(...));
+  ├── registerAgent("PROTOTYPE_GENERATING", new PrototypeGeneratorAgent(...));
+  ├── registerAgent("UI_DESIGNING", new UiDesignGeneratorAgent(...));
+  ├── registerAgent("TECH_PLAN_GENERATING", new TechPlanGeneratorAgent(...));
+  ├── registerAgent("CODE_GENERATING", new CodeGeneratorAgent(...));
+  │
+  └── getAgent(stage) → agentRegistry.get(stage)
+
+【增量更新流程】（用户提交修改意见后触发）
+
+AiEngineServiceImpl.incrementalUpdate(projectId, deliverableId, feedback)
+  │
+  ├── ① 获取当前交付物内容
+  │     currentContent = deliverableVersionRepository.findCurrent(deliverableId)
+  │
+  ├── ② 加载对应的更新 Prompt 模板
+  │     updaterPrompt = promptTemplateRepository.findByKey(
+  │         getUpdaterKeyForType(deliverableType));
+  │     // DOC_UPDATING / PROTOTYPE_UPDATING / UI_DESIGN_UPDATING
+  │
+  ├── ③ 调用 LLM 增量更新
+  │     newContent = llmClient.chat(
+  │         model, updaterPrompt.systemPrompt,
+  │         userPrompt = updaterPrompt.userPrompt
+  │             .replace("{{current_content}}", currentContent)
+  │             .replace("{{feedback}}", feedback.feedbackContent)
+  │     );
+  │
+  ├── ④ 内容校验
+  │     └── 确保更新后的内容结构完整、格式正确
+  │
+  ├── ⑤ 创建新版本
+  │     newVersion = versionService.createVersion(
+  │         deliverableId, nextVersion(currentVersion),
+  │         newContent, triggerType="USER_FEEDBACK");
+  │
+  ├── ⑥ 生成 Diff 变更记录
+  │     diff = aiDiffService.compare(currentContent, newContent);
+  │     changeLogService.createChangeLogs(versionId, diff);
+  │
+  ├── ⑦ 更新反馈状态
+  │     feedbackRepository.updateStatus(feedbackId, COMPLETED, toVersion, newContent)
+  │
+  └── ⑧ SSE 推送完成
+        sseEmitterManager.send(projectId, "update:complete", { newVersion, diff });
+```
+
+---
+
+### 11.7 【M7】数据看板模块
+
+> **依赖**：M1、M2
+> **涉及表**：`t_project`、`t_user`、`t_login_log`、`t_deliverable`、`t_workflow_stage`
+> **关键文件**：`pick-up-service`、`pick-up-api`
+
+#### 11.7.1 SQL 设计
+
+**涉及表清单**：
+
+| 表名 | 职责 | DDL 位置 |
+|------|------|----------|
+| `t_project` | 项目主表 | §6.2.2 |
+| `t_user` | 用户表 | §6.2.1 |
+| `t_deliverable` | 交付物 | §6.2.4 |
+| `t_login_log` | 登录日志 | §6.2.10 |
+| `t_workflow_stage` | 工作流阶段 | §6.2.3 |
+
+**核心统计查询 SQL**：
+
+```sql
+-- 1. 系统概览统计
+SELECT
+    (SELECT COUNT(*) FROM t_project WHERE status != 'DELETED') AS total_projects,
+    (SELECT COUNT(*) FROM t_project WHERE status = 'RUNNING') AS running_projects,
+    (SELECT COUNT(*) FROM t_project WHERE status = 'COMPLETED') AS completed_projects,
+    (SELECT COUNT(*) FROM t_user WHERE status = 'ACTIVE') AS active_users,
+    (SELECT COUNT(*) FROM t_deliverable) AS total_deliverables,
+    (SELECT SUM(used_quota) FROM t_user) AS total_quota_used;
+
+-- 2. 每日项目创建趋势（近30天）
+SELECT DATE(created_at) AS day, COUNT(*) AS count
+FROM t_project
+WHERE created_at >= NOW() - INTERVAL '30 days'
+GROUP BY DATE(created_at)
+ORDER BY day;
+
+-- 3. 阶段耗时统计（平均每个阶段的耗时）
+SELECT ws.stage_name,
+       COUNT(*) AS total_count,
+       AVG(EXTRACT(EPOCH FROM (ws.completed_at - ws.started_at))) AS avg_seconds
+FROM t_workflow_stage ws
+WHERE ws.status = 'COMPLETED' AND ws.started_at IS NOT NULL AND ws.completed_at IS NOT NULL
+  AND ws.completed_at >= NOW() - INTERVAL '30 days'
+GROUP BY ws.stage_name
+ORDER BY avg_seconds DESC;
+
+-- 4. 模板使用分布
+SELECT pt.template_name, COUNT(p.id) AS usage_count
+FROM t_project p
+JOIN t_project_template pt ON p.template_id = pt.id
+WHERE p.status != 'DELETED'
+GROUP BY pt.template_name
+ORDER BY usage_count DESC;
+
+-- 5. 用户活跃度排名（Top10）
+SELECT u.username, u.nickname,
+       COUNT(p.id) AS project_count,
+       COALESCE(SUM(EXTRACT(EPOCH FROM (ws.completed_at - ws.started_at))) / 3600, 0) AS ai_hours_used
+FROM t_user u
+LEFT JOIN t_project p ON u.id = p.user_id
+LEFT JOIN t_workflow_stage ws ON p.id = ws.project_id AND ws.status = 'COMPLETED'
+WHERE p.created_at >= NOW() - INTERVAL '30 days'
+GROUP BY u.id, u.username, u.nickname
+ORDER BY project_count DESC
+LIMIT 10;
+
+-- 6. AI 调用统计（按模型）
+SELECT mc.model_name, mc.provider,
+    (SELECT COUNT(*) FROM t_workflow_stage ws2
+     JOIN t_deliverable_version dv ON ws2.project_id = dv.project_id
+     WHERE dv.trigger_type = 'AI_GENERATE'
+       AND ws2.completed_at >= NOW() - INTERVAL '7 days'
+    ) AS total_calls_7d
+FROM t_model_config mc
+WHERE mc.is_active = TRUE;
+
+-- 7. 登录统计
+SELECT DATE(created_at) AS day,
+       COUNT(*) FILTER (WHERE login_status = 'SUCCESS') AS success,
+       COUNT(*) FILTER (WHERE login_status = 'FAILED') AS failed
+FROM t_login_log
+WHERE created_at >= NOW() - INTERVAL '7 days'
+GROUP BY DATE(created_at)
+ORDER BY day;
+```
+
+#### 11.7.2 前端执行方案
+
+```
+dashboard/                      // 数据看板模块目录
+├── pages/
+│   └── DashboardIndex.vue      // 数据概览页
+│       ├── 顶部: 4个统计数据卡片
+│       │   ├── 项目总数 (el-statistic + trend)
+│       │   ├── 运行中项目
+│       │   ├── 活跃用户
+│       │   └── 本月生成量
+│       │
+│       ├── 行1: 左侧折线图(echarts) + 右侧柱状图(echarts)
+│       │   ├── 项目创建趋势（30天折线图）
+│       │   └── 模板使用分布（柱状图）
+│       │
+│       ├── 行2: 左侧饼图 + 右侧表格
+│       │   ├── 阶段耗时占比（饼图）
+│       │   └── 用户活跃度排名（el-table Top10）
+│       │
+│       └── 行3: AI 调用统计
+│           └── 模型调用量对比（柱状图）
+│
+├── components/
+│   ├── StatCard.vue            // 统计卡片组件
+│   │   └── props: { title, value, icon, trend, trendType }
+│   │
+│   ├── TrendChart.vue          // 趋势折线图组件
+│   │   └── props: { title, data, xKey, yKey }
+│   │
+│   ├── DistributionChart.vue   // 分布图组件（柱状/饼图）
+│   │   └── props: { title, type, data }
+│   │
+│   └── TopRankTable.vue        // 排名表格组件
+│       └── props: { columns, data, rankField }
+│
+├── stores/
+│   └── dashboardStore.ts
+│       ├── fetchOverview() → GET /api/v1/admin/stats/overview
+│       ├── fetchProjectTrend(days) → GET /api/v1/admin/stats/project-trend?days=30
+│       ├── fetchStageStats() → GET /api/v1/admin/stats/stage-stats
+│       ├── fetchTemplateUsage() → GET /api/v1/admin/stats/template-usage
+│       ├── fetchUserRanking() → GET /api/v1/admin/stats/user-ranking
+│       └── fetchAiCallStats() → GET /api/v1/admin/stats/ai-calls
+│
+└── router/
+    └── dashboard.routes.ts
+        └── /dashboard → DashboardIndex.vue
+```
+
+#### 11.7.3 后端执行方案
+
+```
+【看板统计流程】
+
+GET /api/v1/admin/stats/overview
+  │
+  ├── StatsController.overview()
+  │     └── @RequirePermission("stats:view")
+  │
+  └── StatsServiceImpl.getOverview()
+        │
+        ├── ① Redis 缓存检查
+        │     cached = redisTemplate.opsForValue().get("stats:overview")
+        │     └── 命中且在有效期内(5min) → 直接返回
+        │
+        ├── ② 并行查询 6 项统计数据
+        │     CompletableFuture<Long> totalProjects =
+        │         CompletableFuture.supplyAsync(() -> projectRepository.countByStatusNot("DELETED"))
+        │     CompletableFuture<Long> runningProjects =
+        │         CompletableFuture.supplyAsync(() -> projectRepository.countByStatus("RUNNING"))
+        │     CompletableFuture<Long> completedProjects =
+        │         CompletableFuture.supplyAsync(() -> projectRepository.countByStatus("COMPLETED"))
+        │     CompletableFuture<Long> activeUsers =
+        │         CompletableFuture.supplyAsync(() -> userRepository.countByStatus("ACTIVE"))
+        │     CompletableFuture<Long> totalDeliverables =
+        │         CompletableFuture.supplyAsync(() -> deliverableRepository.count())
+        │     CompletableFuture<Long> quotaUsed =
+        │         CompletableFuture.supplyAsync(() -> userRepository.sumUsedQuota())
+        │
+        │     CompletableFuture.allOf(totalProjects, runningProjects, ...).join()
+        │
+        ├── ③ 组装结果
+        │     OverviewStats = {
+        │         totalProjects, runningProjects, completedProjects,
+        │         activeUsers, totalDeliverables, totalQuotaUsed
+        │     }
+        │
+        ├── ④ 写入 Redis 缓存 (TTL=5min)
+        │
+        └── ⑤ 返回 OverviewStats
+
+GET /api/v1/admin/stats/project-trend?days=30
+  │
+  └── StatsServiceImpl.getProjectTrend(days)
+        ├── 使用 GROUP BY DATE(created_at) 统计每日项目数
+        ├── 缺失日期补零（生成连续30天序列，left join）
+        └── 返回 List<DailyCount> [{ date: "2026-05-12", count: 8 }, ...]
+```
+
+---
+
+### 11.8 模块-表映射总览
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           模块 ↔ 表 映射矩阵                              │
+├───────────────┬──────────────────────────────────────────────────────────┤
+│ M1 认证鉴权    │ t_user, t_role, t_user_role, t_login_log                │
+│ M2 项目管理    │ t_project, t_project_template, t_workflow_stage         │
+│               │ t_function_module, t_layout_rule                         │
+│               │ t_template_function, t_template_layout                   │
+│ M3 工作流预览  │ t_deliverable, t_deliverable_version                    │
+│               │ t_deliverable_feedback, t_deliverable_change_log         │
+│               │ t_workflow_subtask, t_workflow_preview_state             │
+│ M4 模板管理    │ t_project_template, t_function_module, t_layout_rule    │
+│               │ t_template_function, t_template_layout                   │
+│               │ t_feature, t_feature_template                            │
+│ M5 系统管理    │ t_user, t_role, t_menu, t_user_role                     │
+│               │ t_role_menu, t_role_api                                  │
+│ M6 AI 引擎     │ t_workflow_stage, t_workflow_subtask                    │
+│               │ t_prompt_template, t_model_config                        │
+│               │ t_deliverable, t_deliverable_version                     │
+│ M7 数据看板    │ t_project, t_user, t_deliverable                        │
+│               │ t_login_log, t_workflow_stage                            │
+└───────────────┴──────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 11.9 模块-接口映射总览
+
+| 模块 | 接口前缀 | 接口数量 | 主要权限标识 |
+|------|----------|----------|-------------|
+| M1 | `/api/v1/auth/**` | 5 个 | 无（除 `/me` 需认证） |
+| M2 | `/api/v1/projects/**` | 6 个 | `project:view/create/edit/delete` |
+| M3 | `/api/v1/deliverables/**`, `/api/v1/workflow/**` | 10 个 | `project:view/edit`, `project:workflow` |
+| M4 | `/api/v1/templates/**`, `/api/v1/admin/templates/**`, `/api/v1/admin/modules/**`, `/api/v1/admin/layouts/**`, `/api/v1/admin/features/**` | 20+ 个 | `template:view/write`, `module:view/write`, `layout:view/write`, `feature:view/write` |
+| M5 | `/api/v1/admin/users/**`, `/api/v1/admin/menus/**`, `/api/v1/admin/roles/**` | 15+ 个 | `user:view/write`, `menu:view/create/edit/delete`, `role:view/write` |
+| M6 | (内部 SSE 推送，无独立 HTTP 接口) | 1 个 SSE | 集成在 M3 的 `/api/v1/workflow/{id}/stream` 中 |
+| M7 | `/api/v1/admin/stats/**` | 6 个 | `stats:view` |
+
+---
+
+> **模块开发顺序**：M1（认证）→ M5（系统管理基础）→ M4（模板管理）→ M2（项目创建）→ M6（AI引擎）→ M3（工作流预览）→ M7（看板）
+>
+> **部署建议**：M1/M5 先上线提供用户登录+管理功能；M2/M4 上线后支持项目创建；M6 接入 LLM 后打通 AI 链路；M3 与 M6 紧密耦合，建议联调；M7 最后作为运营辅助上线
